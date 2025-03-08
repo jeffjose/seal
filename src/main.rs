@@ -140,7 +140,7 @@ fn generate_friendly_filename() -> String {
 }
 
 fn encrypt_directory() -> Result<()> {
-    encrypt_directory_with_password(&get_password("Enter password for encryption: ")?)
+    encrypt_directory_with_password(&get_password("Enter password: ")?)
 }
 
 fn encrypt_directory_with_password(password: &str) -> Result<()> {
@@ -332,7 +332,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
 
     // Setup progress bar
     let total_files = files_to_encrypt.len();
-    println!("Encrypting {} files...", total_files);
+    println!("Encrypting...");
     let pb = ProgressBar::new(total_files as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -391,12 +391,12 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
         fs::remove_file(ENCRYPTED_METADATA_FILE)?;
     }
 
-    println!("Encryption complete!");
+    println!("Done.");
     Ok(())
 }
 
 fn decrypt_directory() -> Result<()> {
-    decrypt_directory_with_password(&get_password("Enter password for decryption: ")?)
+    decrypt_directory_with_password(&get_password("Enter password: ")?)
 }
 
 fn decrypt_directory_with_password(password: &str) -> Result<()> {
@@ -592,7 +592,7 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
 
     // Setup progress bar for decryption
     let total_files = files_to_decrypt.len();
-    println!("Decrypting {} files...", total_files);
+    println!("Decrypting...");
     let pb = ProgressBar::new((total_files * 2) as u64); // Account for both decrypt and write operations
     pb.set_style(
         ProgressStyle::default_bar()
@@ -640,10 +640,7 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
 
     // Finish progress bar
     pb.finish_and_clear();
-    println!(
-        "Decryption complete! {} files decrypted.",
-        decrypted_files.len()
-    );
+    println!("Done.");
 
     // Metadata files are now cleaned up in the decrypt_directory_with_password function
 

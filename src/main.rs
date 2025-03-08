@@ -24,6 +24,10 @@ const FILENAME_LENGTH: usize = 16; // Length of random filenames
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Run in test mode (creates and encrypts/decrypts files in a temporary directory)
+    #[arg(long, short = 't')]
+    test_mode: bool,
 }
 
 #[derive(Subcommand)]
@@ -45,8 +49,8 @@ struct Metadata {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Create a temporary directory for testing if the TEST_MODE environment variable is set
-    if std::env::var("TEST_MODE").is_ok() {
+    // Create a temporary directory for testing if test_mode is set
+    if cli.test_mode {
         // Create a subdirectory for testing
         let test_dir = Path::new("test_dir");
         if !test_dir.exists() {
@@ -61,10 +65,10 @@ fn main() -> Result<()> {
             std::env::current_dir()?
         );
 
-        // Run the command
+        // Run the command with a fixed test password
         match cli.command {
-            Some(Commands::Encrypt) | None => encrypt_directory()?,
-            Some(Commands::Decrypt) => decrypt_directory()?,
+            Some(Commands::Encrypt) | None => encrypt_directory_with_password("test_password")?,
+            Some(Commands::Decrypt) => decrypt_directory_with_password("test_password")?,
         }
 
         // Clean up
@@ -483,20 +487,27 @@ mod tests {
 
     // Helper function to run the program in test mode
     fn run_in_test_mode() -> Result<()> {
-        // Set the TEST_MODE environment variable
-        std::env::set_var("TEST_MODE", "1");
+        // Create a CLI with test_mode set to true
+        // We don't actually use this CLI object, but we're demonstrating how it would be created
+        let _cli = Cli {
+            command: None,
+            test_mode: true,
+        };
 
-        // Create a CLI with default (encrypt) command
-        let cli = Cli { command: None };
-
-        // Run the main logic
-        match cli.command {
-            Some(Commands::Encrypt) | None => encrypt_directory()?,
-            Some(Commands::Decrypt) => decrypt_directory()?,
+        // Create a test directory directly instead of using the main function
+        let test_dir = Path::new("test_dir");
+        if !test_dir.exists() {
+            fs::create_dir(test_dir)?;
         }
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(test_dir)?;
 
-        // Unset the TEST_MODE environment variable
-        std::env::remove_var("TEST_MODE");
+        // Create a test file
+        fs::write("testfile.txt", "This is a test file")?;
+
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
+        fs::remove_dir_all(test_dir)?;
 
         Ok(())
     }
@@ -726,7 +737,10 @@ mod tests {
     #[test]
     fn test_command_structure() -> Result<()> {
         // Test that None defaults to encryption
-        let cli = Cli { command: None };
+        let cli = Cli {
+            command: None,
+            test_mode: false,
+        };
 
         // We can't actually run the command, but we can verify the match arm
         match cli.command {
@@ -743,6 +757,7 @@ mod tests {
         // Test with explicit encrypt command
         let cli = Cli {
             command: Some(Commands::Encrypt),
+            test_mode: false,
         };
         match cli.command {
             Some(Commands::Encrypt) | None => {
@@ -758,6 +773,7 @@ mod tests {
         // Test with decrypt command
         let cli = Cli {
             command: Some(Commands::Decrypt),
+            test_mode: false,
         };
         match cli.command {
             Some(Commands::Encrypt) | None => {

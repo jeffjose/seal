@@ -585,12 +585,8 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
         }
     }
 
-    // Print debug info about decryption
-    println!("Files to decrypt: {:?}", files_to_decrypt);
-    println!("Decrypted files count: {}", decrypted_files.len());
-    for (name, _) in &decrypted_files {
-        println!("Have decrypted content for: {}", name);
-    }
+    // Print a simple count of files to decrypt
+    println!("Decrypting {} files...", decrypted_files.len());
 
     // Second pass: write decrypted files and clean up
     for (encrypted_name, original_name) in &files_to_decrypt {
@@ -607,17 +603,17 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                 }
                 fs::write(original_name, decrypted)?;
                 fs::remove_file(encrypted_name)?;
-                println!("Decrypted: {}", original_name);
+                // Don't print each file as it's decrypted
             }
             None => {
-                println!("Warning: No decrypted content found for {}", original_name);
+                println!("Warning: Failed to decrypt {}", original_name);
             }
         }
     }
 
     // Metadata files are now cleaned up in the decrypt_directory_with_password function
 
-    println!("Decryption complete!");
+    println!("Done. {} files decrypted.", decrypted_files.len());
     Ok(())
 }
 

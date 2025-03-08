@@ -6,6 +6,7 @@ use anyhow::Result;
 use argon2::Argon2;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use nanoid::nanoid;
 use rand::{rngs::OsRng, RngCore};
 use rpassword::read_password;
@@ -329,6 +330,17 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
         }
     }
 
+    // Setup progress bar
+    let total_files = files_to_encrypt.len();
+    println!("Encrypting {} files...", total_files);
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("█▓▒░"),
+    );
+
     // Encrypt each file
     for path in files_to_encrypt {
         let encrypted = encrypt_file(&path, &cipher)?;
@@ -345,8 +357,13 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
         metadata
             .files
             .insert(encrypted_name.clone(), original_name.clone());
-        println!("Encrypted: {}", original_name);
+
+        // Update progress bar
+        pb.inc(1);
     }
+
+    // Finish progress bar
+    pb.finish_with_message("Encryption complete");
 
     // Save metadata as a string first
     let metadata_string = format!(
@@ -573,20 +590,42 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
     let files_to_decrypt: Vec<_> = files.clone().into_iter().collect();
     let mut decrypted_files = Vec::new();
 
+    // Setup progress bar for first pass (decryption)
+    let total_files = files_to_decrypt.len();
+    println!("Decrypting {} files...", total_files);
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("█▓▒░"),
+    );
+
     // First pass: decrypt all files to temporary storage
     for (encrypted_name, original_name) in &files_to_decrypt {
         match decrypt_file(Path::new(encrypted_name), cipher) {
             Ok(decrypted) => {
                 decrypted_files.push((original_name.clone(), decrypted));
+                pb.inc(1);
             }
             Err(_) => {
+                pb.abandon_with_message("Decryption failed");
                 return Err(anyhow::anyhow!("Invalid password"));
             }
         }
     }
 
-    // Print a simple count of files to decrypt
-    println!("Decrypting {} files...", decrypted_files.len());
+    // Finish first progress bar
+    pb.finish();
+
+    // Setup progress bar for second pass (writing files)
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("█▓▒░"),
+    );
 
     // Second pass: write decrypted files and clean up
     for (encrypted_name, original_name) in &files_to_decrypt {
@@ -603,7 +642,7 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                 }
                 fs::write(original_name, decrypted)?;
                 fs::remove_file(encrypted_name)?;
-                // Don't print each file as it's decrypted
+                pb.inc(1);
             }
             None => {
                 println!("Warning: Failed to decrypt {}", original_name);
@@ -611,9 +650,11 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
         }
     }
 
+    // Finish second progress bar
+    pb.finish_with_message(format!("Done. {} files decrypted.", decrypted_files.len()));
+
     // Metadata files are now cleaned up in the decrypt_directory_with_password function
 
-    println!("Done. {} files decrypted.", decrypted_files.len());
     Ok(())
 }
 

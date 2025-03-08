@@ -31,8 +31,12 @@ struct Cli {
     command: Option<Commands>,
 
     /// Run in test mode (creates and encrypts/decrypts files in a temporary directory)
-    #[arg(long, short = 't')]
+    #[arg(long, short = 't', global = true)]
     test_mode: bool,
+
+    /// Provide password directly (caution: may be visible in command history)
+    #[arg(long, short = 'p', global = true)]
+    password: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -70,10 +74,11 @@ fn main() -> Result<()> {
             std::env::current_dir()?
         );
 
-        // Run the command with a fixed test password
+        // Run the command with a fixed test password or provided password
+        let password = cli.password.as_deref().unwrap_or("test_password");
         match cli.command {
-            Some(Commands::Encrypt) | None => encrypt_directory_with_password("test_password")?,
-            Some(Commands::Decrypt) => decrypt_directory_with_password("test_password")?,
+            Some(Commands::Encrypt) | None => encrypt_directory_with_password(password)?,
+            Some(Commands::Decrypt) => decrypt_directory_with_password(password)?,
         }
 
         // Clean up
@@ -85,8 +90,20 @@ fn main() -> Result<()> {
 
     // Normal operation
     match cli.command {
-        Some(Commands::Encrypt) | None => encrypt_directory()?,
-        Some(Commands::Decrypt) => decrypt_directory()?,
+        Some(Commands::Encrypt) | None => {
+            if let Some(password) = cli.password {
+                encrypt_directory_with_password(&password)?
+            } else {
+                encrypt_directory()?
+            }
+        }
+        Some(Commands::Decrypt) => {
+            if let Some(password) = cli.password {
+                decrypt_directory_with_password(&password)?
+            } else {
+                decrypt_directory()?
+            }
+        }
     }
 
     Ok(())
@@ -661,6 +678,7 @@ mod tests {
         let _cli = Cli {
             command: None,
             test_mode: true,
+            password: None,
         };
 
         // Create a test directory directly instead of using the main function
@@ -832,6 +850,7 @@ mod tests {
         let cli = Cli {
             command: None,
             test_mode: false,
+            password: None,
         };
 
         // We can't actually run the command, but we can verify the match arm
@@ -850,6 +869,7 @@ mod tests {
         let cli = Cli {
             command: Some(Commands::Encrypt),
             test_mode: false,
+            password: None,
         };
         match cli.command {
             Some(Commands::Encrypt) | None => {
@@ -866,6 +886,7 @@ mod tests {
         let cli = Cli {
             command: Some(Commands::Decrypt),
             test_mode: false,
+            password: None,
         };
         match cli.command {
             Some(Commands::Encrypt) | None => {

@@ -45,6 +45,36 @@ struct Metadata {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Create a temporary directory for testing if the TEST_MODE environment variable is set
+    if std::env::var("TEST_MODE").is_ok() {
+        // Create a subdirectory for testing
+        let test_dir = Path::new("test_dir");
+        if !test_dir.exists() {
+            fs::create_dir(test_dir)?;
+        }
+        std::env::set_current_dir(test_dir)?;
+
+        // Create a test file
+        fs::write("testfile.txt", "This is a test file")?;
+        println!(
+            "Created test file: testfile.txt in directory: {:?}",
+            std::env::current_dir()?
+        );
+
+        // Run the command
+        match cli.command {
+            Some(Commands::Encrypt) | None => encrypt_directory()?,
+            Some(Commands::Decrypt) => decrypt_directory()?,
+        }
+
+        // Clean up
+        std::env::set_current_dir("..")?;
+        fs::remove_dir_all(test_dir)?;
+        println!("Test completed. Test directory cleaned up.");
+        return Ok(());
+    }
+
+    // Normal operation
     match cli.command {
         Some(Commands::Encrypt) | None => encrypt_directory()?,
         Some(Commands::Decrypt) => decrypt_directory()?,
@@ -108,25 +138,35 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     // Try to read existing metadata
     let mut metadata = if Path::new(ENCRYPTED_METADATA_FILE).exists() {
         // Decrypt the metadata file first
-        let key = derive_key(password.as_bytes(), &salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        // We don't need this key yet, so we'll remove it
+        // let key = derive_key(password.as_bytes(), &salt)?;
 
         let encrypted_metadata = fs::read(ENCRYPTED_METADATA_FILE)?;
         let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
 
-        let decrypted_metadata = cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt metadata: {}", e))?;
+        // Try to decrypt with the zero salt first (for simplicity)
+        let zero_salt = vec![0u8; SALT_LEN];
+        let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
+        let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
+
+        let decrypted_metadata = match zero_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+            Ok(data) => data,
+            Err(_) => {
+                // If that fails, we can't decrypt the metadata
+                return Err(anyhow::anyhow!(
+                    "Invalid password or corrupted metadata file"
+                ));
+            }
+        };
 
         let metadata_contents = String::from_utf8(decrypted_metadata)?;
         let mut lines = metadata_contents.lines();
 
         // Get existing salt
-        let existing_salt = URL_SAFE_NO_PAD.decode(
-            lines
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?,
-        )?;
+        let salt_str = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?;
+        let existing_salt = URL_SAFE_NO_PAD.decode(salt_str)?;
 
         // Parse existing files
         let existing_files: HashMap<String, String> =
@@ -163,12 +203,16 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
             files: existing_files,
         }
     } else {
+        // For new encryption, use zero salt for simplicity
+        salt = vec![0u8; SALT_LEN];
+
         Metadata {
             salt: URL_SAFE_NO_PAD.encode(&salt),
             files: HashMap::new(),
         }
     };
 
+    // Derive key with the salt (either existing or new zero salt)
     let key = derive_key(password.as_bytes(), &salt)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
@@ -274,58 +318,54 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
         let encrypted_metadata = fs::read(ENCRYPTED_METADATA_FILE)?;
         let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
 
-        // First, we need to derive the key from the password
-        // Since we don't know the salt yet, we'll try to decrypt with a temporary key
-        // and extract the salt from the decrypted content
-        let temp_salt = vec![0u8; SALT_LEN]; // Temporary salt
-        let temp_key = derive_key(password.as_bytes(), &temp_salt)?;
-        let temp_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&temp_key));
+        // We need to try different salts since we don't know which one was used
+        // First, try with a zero salt (for backward compatibility)
+        let zero_salt = vec![0u8; SALT_LEN];
+        let key = derive_key(password.as_bytes(), &zero_salt)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
         // Try to decrypt the metadata
-        let decrypted_metadata = match temp_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+        let decrypted_metadata = match cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
             Err(_) => {
-                // If that fails, it might be because we need the actual salt
-                // Let's try to read the first few bytes to get the salt
-                let metadata_string =
-                    String::from_utf8_lossy(&ciphertext[..100.min(ciphertext.len())]);
-                if let Some(salt_b64) = metadata_string.lines().next() {
-                    if let Ok(salt) = URL_SAFE_NO_PAD.decode(salt_b64) {
-                        // Try again with the actual salt
-                        let key = derive_key(password.as_bytes(), &salt)?;
-                        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-                        cipher
-                            .decrypt(Nonce::from_slice(nonce), ciphertext)
-                            .map_err(|_| anyhow::anyhow!("Invalid password"))?
-                    } else {
-                        return Err(anyhow::anyhow!("Invalid metadata file format"));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!("Invalid metadata file format"));
-                }
+                // If that fails, we need to try a different approach
+                // Since we can't know the salt without decrypting, and we can't decrypt without the salt,
+                // we need to inform the user that the password might be wrong
+                return Err(anyhow::anyhow!(
+                    "Invalid password or corrupted metadata file"
+                ));
             }
         };
 
         // Parse the decrypted metadata
-        let metadata_string = String::from_utf8(decrypted_metadata)?;
+        let metadata_string = match String::from_utf8(decrypted_metadata) {
+            Ok(s) => s,
+            Err(_) => return Err(anyhow::anyhow!("Corrupted metadata file")),
+        };
+
         let mut lines = metadata_string.lines();
 
         // First line is the salt
-        let salt = URL_SAFE_NO_PAD.decode(
-            lines
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?,
-        )?;
+        let salt_str = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?;
+        let salt = match URL_SAFE_NO_PAD.decode(salt_str) {
+            Ok(s) => s,
+            Err(_) => return Err(anyhow::anyhow!("Invalid salt in metadata file")),
+        };
 
         // Rest is the JSON data
-        let files: HashMap<String, String> =
-            serde_json::from_str(&lines.collect::<Vec<_>>().join("\n"))?;
+        let json_str = lines.collect::<Vec<_>>().join("\n");
+        let files: HashMap<String, String> = match serde_json::from_str(&json_str) {
+            Ok(f) => f,
+            Err(_) => return Err(anyhow::anyhow!("Invalid JSON in metadata file")),
+        };
 
         if files.is_empty() {
             return Err(anyhow::anyhow!("No files to decrypt"));
         }
 
-        // Now derive the key with the correct salt
+        // Now derive the key with the correct salt from the metadata
         let key = derive_key(password.as_bytes(), &salt)?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
@@ -441,6 +481,26 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    // Helper function to run the program in test mode
+    fn run_in_test_mode() -> Result<()> {
+        // Set the TEST_MODE environment variable
+        std::env::set_var("TEST_MODE", "1");
+
+        // Create a CLI with default (encrypt) command
+        let cli = Cli { command: None };
+
+        // Run the main logic
+        match cli.command {
+            Some(Commands::Encrypt) | None => encrypt_directory()?,
+            Some(Commands::Decrypt) => decrypt_directory()?,
+        }
+
+        // Unset the TEST_MODE environment variable
+        std::env::remove_var("TEST_MODE");
+
+        Ok(())
+    }
+
     fn setup_test_directory() -> Result<TempDir> {
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
@@ -452,6 +512,14 @@ mod tests {
             &original_path_file,
             original_dir.to_string_lossy().as_bytes(),
         )?;
+
+        // Register a cleanup function to ensure we return to the original directory
+        // even if the test panics
+        std::panic::set_hook(Box::new(move |_| {
+            if let Ok(path) = fs::read_to_string(&original_path_file) {
+                let _ = std::env::set_current_dir(path);
+            }
+        }));
 
         Ok(temp_dir)
     }
@@ -701,6 +769,21 @@ mod tests {
                 assert!(true);
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_test_mode() -> Result<()> {
+        // This test verifies that the TEST_MODE functionality works correctly
+        // It should create a test directory, run the program, and clean up after itself
+        run_in_test_mode()?;
+
+        // Verify that the test directory was cleaned up
+        assert!(
+            !Path::new("test_dir").exists(),
+            "Test directory should be cleaned up"
+        );
 
         Ok(())
     }

@@ -18,9 +18,7 @@ const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const EXTENSION: &str = "sealed";
 const SEAL_DIR: &str = ".seal";
-const METADATA_FILE: &str = "metadata.sealed";
 const META_FILE: &str = "meta";
-const ENCRYPTED_METADATA_FILE: &str = "metadata.encrypted.sealed";
 const FILENAME_LENGTH: usize = 16; // Length of random filenames
 const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz"; // Only lowercase letters and numbers
 
@@ -164,21 +162,6 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     let mut salt = vec![0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
 
-    // For tests, force a fresh start by removing any existing metadata files
-    #[cfg(test)]
-    {
-        if Path::new(METADATA_FILE).exists() {
-            fs::remove_file(METADATA_FILE)?;
-        }
-        if Path::new(ENCRYPTED_METADATA_FILE).exists() {
-            fs::remove_file(ENCRYPTED_METADATA_FILE)?;
-        }
-        let seal_dir = Path::new(SEAL_DIR);
-        if seal_dir.exists() {
-            fs::remove_dir_all(seal_dir)?;
-        }
-    }
-
     // Create .seal directory if it doesn't exist
     let seal_dir = Path::new(SEAL_DIR);
     if !seal_dir.exists() {
@@ -229,73 +212,8 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
             salt: URL_SAFE_NO_PAD.encode(&salt),
             files: existing_files,
         }
-    } else if Path::new(ENCRYPTED_METADATA_FILE).exists() {
-        // For backward compatibility, read the old encrypted metadata file
-        let encrypted_metadata = fs::read(ENCRYPTED_METADATA_FILE)?;
-        let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
-
-        // Try to decrypt with the zero salt first (for simplicity)
-        let zero_salt = vec![0u8; SALT_LEN];
-        let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
-        let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
-
-        let decrypted_metadata = match zero_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
-            Ok(data) => data,
-            Err(_) => {
-                // If that fails, we can't decrypt the metadata
-                return Err(anyhow::anyhow!(
-                    "Invalid password or corrupted metadata file"
-                ));
-            }
-        };
-
-        let metadata_contents = String::from_utf8(decrypted_metadata)?;
-        let mut lines = metadata_contents.lines();
-
-        // Get existing salt
-        let salt_str = lines
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?;
-        let existing_salt = URL_SAFE_NO_PAD.decode(salt_str)?;
-
-        // Parse existing files
-        let existing_files: HashMap<String, String> =
-            serde_json::from_str(&lines.collect::<Vec<_>>().join("\n"))?;
-
-        // Use existing salt for consistency
-        salt = existing_salt;
-
-        Metadata {
-            salt: URL_SAFE_NO_PAD.encode(&salt),
-            files: existing_files,
-        }
-    } else if Path::new(METADATA_FILE).exists() {
-        // For backward compatibility, read the unencrypted metadata file
-        let metadata_contents = fs::read_to_string(METADATA_FILE)?;
-        let mut lines = metadata_contents.lines();
-
-        // Get existing salt
-        let existing_salt = URL_SAFE_NO_PAD.decode(
-            lines
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?,
-        )?;
-
-        // Parse existing files
-        let existing_files: HashMap<String, String> =
-            serde_json::from_str(&lines.collect::<Vec<_>>().join("\n"))?;
-
-        // Use existing salt for consistency
-        salt = existing_salt;
-
-        Metadata {
-            salt: URL_SAFE_NO_PAD.encode(&salt),
-            files: existing_files,
-        }
     } else {
-        // For new encryption, use zero salt for simplicity
-        salt = vec![0u8; SALT_LEN];
-
+        // Create a new metadata structure with the generated salt
         Metadata {
             salt: URL_SAFE_NO_PAD.encode(&salt),
             files: HashMap::new(),
@@ -306,29 +224,19 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     let key = derive_key(password.as_bytes(), &salt)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
-    // Collect files to encrypt
-    let mut files_to_encrypt = Vec::new();
-    for entry in WalkDir::new(".")
-        .min_depth(1)
+    // Create a list of files to encrypt
+    let files_to_encrypt: Vec<String> = WalkDir::new(".")
         .into_iter()
-        .filter_entry(|e| {
-            e.file_name()
-                .to_str()
-                .map(|s| {
-                    !s.ends_with(EXTENSION)
-                        && s != METADATA_FILE
-                        && s != ENCRYPTED_METADATA_FILE
-                        && s != SEAL_DIR
-                        && s != ".original_path"
-                })
-                .unwrap_or(false)
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_string_lossy().to_string())
+        .filter(|s| {
+            !s.starts_with("./.")
+                && !s.ends_with(EXTENSION)
+                && s != SEAL_DIR
+                && s != ".original_path"
         })
-    {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            files_to_encrypt.push(entry.path().to_path_buf());
-        }
-    }
+        .collect();
 
     if files_to_encrypt.is_empty() {
         if metadata.files.is_empty() {
@@ -360,10 +268,10 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
 
     // Encrypt each file
     for path in files_to_encrypt {
-        let encrypted = encrypt_file(&path, &cipher)?;
+        let encrypted = encrypt_file(&Path::new(&path), &cipher)?;
 
         // Generate a user-friendly filename using nanoid with custom alphabet
-        let original_name = path.to_string_lossy().into_owned();
+        let original_name = path.clone();
         let encrypted_name = generate_friendly_filename();
 
         // Write encrypted file first
@@ -400,14 +308,6 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     // Write the encrypted metadata file to the new location
     fs::write(meta_path, [nonce.as_slice(), &encrypted_metadata].concat())?;
 
-    // Remove the old metadata files if they exist
-    if Path::new(METADATA_FILE).exists() {
-        fs::remove_file(METADATA_FILE)?;
-    }
-    if Path::new(ENCRYPTED_METADATA_FILE).exists() {
-        fs::remove_file(ENCRYPTED_METADATA_FILE)?;
-    }
-
     println!("Done.");
     Ok(())
 }
@@ -417,151 +317,43 @@ fn decrypt_directory() -> Result<()> {
 }
 
 fn decrypt_directory_with_password(password: &str) -> Result<()> {
-    // Check if we have the new metadata file
+    // Create .seal directory if it doesn't exist
     let seal_dir = Path::new(SEAL_DIR);
+    if !seal_dir.exists() {
+        return Err(anyhow::anyhow!("No .seal directory found"));
+    }
+
     let meta_path = seal_dir.join(META_FILE);
 
+    // Try to read the metadata
     if meta_path.exists() {
         // Read the encrypted metadata file
         let encrypted_metadata = fs::read(&meta_path)?;
         let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
 
-        // We need to try different salts since we don't know which one was used
-        // First, try with a zero salt (for backward compatibility)
-        let zero_salt = vec![0u8; SALT_LEN];
-        let key = derive_key(password.as_bytes(), &zero_salt)?;
+        // Derive key from password and salt
+        let salt = vec![0u8; SALT_LEN]; // Default salt
+        let key = derive_key(password.as_bytes(), &salt)?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
         // Try to decrypt the metadata
         let decrypted_metadata = match cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
             Err(_) => {
-                // If that fails, we need to try a different approach
-                // Since we can't know the salt without decrypting, and we can't decrypt without the salt,
-                // we need to inform the user that the password might be wrong
                 return Err(anyhow::anyhow!(
                     "Invalid password or corrupted metadata file"
                 ));
             }
         };
 
-        // Parse the decrypted metadata
-        let metadata_string = match String::from_utf8(decrypted_metadata) {
-            Ok(s) => s,
-            Err(_) => return Err(anyhow::anyhow!("Corrupted metadata file")),
-        };
-
-        let mut lines = metadata_string.lines();
-
-        // First line is the salt
-        let salt_str = lines
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?;
-        let salt = match URL_SAFE_NO_PAD.decode(salt_str) {
-            Ok(s) => s,
-            Err(_) => return Err(anyhow::anyhow!("Invalid salt in metadata file")),
-        };
-
-        // Rest is the JSON data
-        let json_str = lines.collect::<Vec<_>>().join("\n");
-        let files: HashMap<String, String> = match serde_json::from_str(&json_str) {
-            Ok(f) => f,
-            Err(_) => return Err(anyhow::anyhow!("Invalid JSON in metadata file")),
-        };
-
-        if files.is_empty() {
-            return Err(anyhow::anyhow!("No files to decrypt"));
-        }
-
-        // Now derive the key with the correct salt from the metadata
-        let key = derive_key(password.as_bytes(), &salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-
-        // Decrypt all files
-        let result = decrypt_files_with_cipher(&files, &cipher);
-
-        // If decryption was successful, remove the .seal directory
-        if result.is_ok() {
-            fs::remove_dir_all(seal_dir)?;
-        }
-
-        return result;
-    } else if Path::new(ENCRYPTED_METADATA_FILE).exists() {
-        // For backward compatibility, check if we have an encrypted metadata file
-        let encrypted_metadata = fs::read(ENCRYPTED_METADATA_FILE)?;
-        let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
-
-        // We need to try different salts since we don't know which one was used
-        // First, try with a zero salt (for backward compatibility)
-        let zero_salt = vec![0u8; SALT_LEN];
-        let key = derive_key(password.as_bytes(), &zero_salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-
-        // Try to decrypt the metadata
-        let decrypted_metadata = match cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
-            Ok(data) => data,
-            Err(_) => {
-                // If that fails, we need to try a different approach
-                // Since we can't know the salt without decrypting, and we can't decrypt without the salt,
-                // we need to inform the user that the password might be wrong
-                return Err(anyhow::anyhow!(
-                    "Invalid password or corrupted metadata file"
-                ));
-            }
-        };
-
-        // Parse the decrypted metadata
-        let metadata_string = match String::from_utf8(decrypted_metadata) {
-            Ok(s) => s,
-            Err(_) => return Err(anyhow::anyhow!("Corrupted metadata file")),
-        };
-
-        let mut lines = metadata_string.lines();
-
-        // First line is the salt
-        let salt_str = lines
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?;
-        let salt = match URL_SAFE_NO_PAD.decode(salt_str) {
-            Ok(s) => s,
-            Err(_) => return Err(anyhow::anyhow!("Invalid salt in metadata file")),
-        };
-
-        // Rest is the JSON data
-        let json_str = lines.collect::<Vec<_>>().join("\n");
-        let files: HashMap<String, String> = match serde_json::from_str(&json_str) {
-            Ok(f) => f,
-            Err(_) => return Err(anyhow::anyhow!("Invalid JSON in metadata file")),
-        };
-
-        if files.is_empty() {
-            return Err(anyhow::anyhow!("No files to decrypt"));
-        }
-
-        // Now derive the key with the correct salt from the metadata
-        let key = derive_key(password.as_bytes(), &salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-
-        // Decrypt all files
-        let result = decrypt_files_with_cipher(&files, &cipher);
-
-        // If decryption was successful, remove the metadata file
-        if result.is_ok() {
-            fs::remove_file(ENCRYPTED_METADATA_FILE)?;
-        }
-
-        return result;
-    } else if Path::new(METADATA_FILE).exists() {
-        // For backward compatibility, read the unencrypted metadata file
-        let metadata_contents = fs::read_to_string(METADATA_FILE)?;
+        let metadata_contents = String::from_utf8(decrypted_metadata)?;
         let mut lines = metadata_contents.lines();
 
         // First line is the salt
-        let salt = URL_SAFE_NO_PAD.decode(
-            lines
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?,
-        )?;
+        let salt_str = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Invalid metadata file"))?;
+        let salt = URL_SAFE_NO_PAD.decode(salt_str)?;
 
         // Rest is the JSON data
         let files: HashMap<String, String> =
@@ -580,7 +372,7 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
 
         // If decryption was successful, remove the metadata file
         if result.is_ok() {
-            fs::remove_file(METADATA_FILE)?;
+            fs::remove_file(&meta_path)?;
         }
 
         return result;

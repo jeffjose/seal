@@ -363,7 +363,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     }
 
     // Finish progress bar
-    pb.finish_with_message("Encryption complete");
+    pb.finish_and_clear();
 
     // Save metadata as a string first
     let metadata_string = format!(
@@ -590,10 +590,10 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
     let files_to_decrypt: Vec<_> = files.clone().into_iter().collect();
     let mut decrypted_files = Vec::new();
 
-    // Setup progress bar for first pass (decryption)
+    // Setup progress bar for decryption
     let total_files = files_to_decrypt.len();
     println!("Decrypting {} files...", total_files);
-    let pb = ProgressBar::new(total_files as u64);
+    let pb = ProgressBar::new((total_files * 2) as u64); // Account for both decrypt and write operations
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len}")
@@ -614,18 +614,6 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
             }
         }
     }
-
-    // Finish first progress bar
-    pb.finish();
-
-    // Setup progress bar for second pass (writing files)
-    let pb = ProgressBar::new(total_files as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len}")
-            .unwrap()
-            .progress_chars("█▓▒░"),
-    );
 
     // Second pass: write decrypted files and clean up
     for (encrypted_name, original_name) in &files_to_decrypt {
@@ -650,8 +638,12 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
         }
     }
 
-    // Finish second progress bar
-    pb.finish_with_message(format!("Done. {} files decrypted.", decrypted_files.len()));
+    // Finish progress bar
+    pb.finish_and_clear();
+    println!(
+        "Decryption complete! {} files decrypted.",
+        decrypted_files.len()
+    );
 
     // Metadata files are now cleaned up in the decrypt_directory_with_password function
 

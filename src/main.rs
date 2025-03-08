@@ -6,10 +6,11 @@ use anyhow::Result;
 use argon2::Argon2;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Parser, Subcommand};
+use nanoid::nanoid;
 use rand::{rngs::OsRng, RngCore};
 use rpassword::read_password;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, io::Write, path::Path};
 use walkdir::WalkDir;
 
 const SALT_LEN: usize = 32;
@@ -20,6 +21,7 @@ const METADATA_FILE: &str = "metadata.sealed";
 const META_FILE: &str = "meta";
 const ENCRYPTED_METADATA_FILE: &str = "metadata.encrypted.sealed";
 const FILENAME_LENGTH: usize = 16; // Length of random filenames
+const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz"; // Only lowercase letters and numbers
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -91,6 +93,7 @@ fn main() -> Result<()> {
 
 fn get_password(prompt: &str) -> Result<String> {
     print!("{}", prompt);
+    std::io::stdout().flush()?;
     Ok(read_password()?)
 }
 
@@ -121,6 +124,18 @@ fn decrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
+}
+
+/// Generate a user-friendly filename using nanoid with a custom alphabet
+fn generate_friendly_filename() -> String {
+    format!(
+        "{}.{}",
+        nanoid!(
+            FILENAME_LENGTH,
+            &NANOID_ALPHABET.chars().collect::<Vec<char>>()
+        ),
+        EXTENSION
+    )
 }
 
 fn encrypt_directory() -> Result<()> {
@@ -318,11 +333,9 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     for path in files_to_encrypt {
         let encrypted = encrypt_file(&path, &cipher)?;
 
-        // Generate random filename of consistent length
+        // Generate a user-friendly filename using nanoid with custom alphabet
         let original_name = path.to_string_lossy().into_owned();
-        let mut random_name = vec![0u8; FILENAME_LENGTH];
-        OsRng.fill_bytes(&mut random_name);
-        let encrypted_name = format!("{}.{}", URL_SAFE_NO_PAD.encode(&random_name), EXTENSION);
+        let encrypted_name = generate_friendly_filename();
 
         // Write encrypted file first
         fs::write(&encrypted_name, encrypted)?;
@@ -741,10 +754,8 @@ mod tests {
         let key = derive_key(password, &salt)?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
-        // Generate a random filename
-        let mut random_name = vec![0u8; FILENAME_LENGTH];
-        OsRng.fill_bytes(&mut random_name);
-        let encrypted_name = format!("{}.{}", URL_SAFE_NO_PAD.encode(&random_name), EXTENSION);
+        // Generate a filename using nanoid with custom alphabet
+        let encrypted_name = generate_friendly_filename();
 
         // Verify the filename has the expected format
         assert!(encrypted_name.ends_with(EXTENSION));

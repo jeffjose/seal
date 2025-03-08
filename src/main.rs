@@ -31,7 +31,7 @@ struct Cli {
     command: Option<Commands>,
 
     /// Run in test mode (creates and encrypts/decrypts files in a temporary directory)
-    #[arg(long, short = 't', global = true)]
+    #[arg(long, global = true, hide = true)]
     test_mode: bool,
 
     /// Provide password directly (caution: may be visible in command history)

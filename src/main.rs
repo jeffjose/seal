@@ -13,8 +13,6 @@ use rpassword::read_password;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
-use tempfile::{tempdir, TempDir};
-use uuid;
 use walkdir::WalkDir;
 
 const SALT_LEN: usize = 32;

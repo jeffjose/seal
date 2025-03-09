@@ -11,6 +11,7 @@ use nanoid::nanoid;
 use rand::{rngs::OsRng, RngCore};
 use rpassword::read_password;
 use serde::{Deserialize, Serialize};
+use shell_escape::escape;
 use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
 use walkdir::WalkDir;
@@ -95,37 +96,39 @@ fn main() -> Result<()> {
     match &cli.command {
         Some(Commands::Encrypt { files }) => {
             if let Some(password) = &cli.password {
-                encrypt_directory_with_password_and_files(password, files)?
+                encrypt_directory_with_password_and_files(password, files)?;
             } else {
                 let password = get_password("Enter password: ")?;
-                encrypt_directory_with_password_and_files(&password, files)?
+                encrypt_directory_with_password_and_files(&password, files)?;
             }
         }
         Some(Commands::Decrypt { files }) => {
             if let Some(password) = &cli.password {
-                decrypt_directory_with_password_and_files(password, files)?
+                decrypt_directory_with_password_and_files(password, files)?;
             } else {
                 let password = get_password("Enter password: ")?;
-                decrypt_directory_with_password_and_files(&password, files)?
+                decrypt_directory_with_password_and_files(&password, files)?;
             }
         }
-        Some(Commands::Status) => status_directory()?,
+        Some(Commands::Status) => {
+            status_directory()?;
+        }
         Some(Commands::Run { command }) => {
             if let Some(password) = &cli.password {
-                run_command_on_files(command, Some(password))?
+                run_command_on_files(command, Some(password))?;
             } else {
-                run_command_on_files(command, None)?
+                run_command_on_files(command, None)?;
             }
         }
         None => {
             if let Some(password) = &cli.password {
-                encrypt_directory_with_password_and_files(password, &cli.files)?
+                encrypt_directory_with_password_and_files(password, &cli.files)?;
             } else {
                 if cli.files.is_empty() {
-                    encrypt_directory()?
+                    encrypt_directory()?;
                 } else {
                     let password = get_password("Enter password: ")?;
-                    encrypt_directory_with_password_and_files(&password, &cli.files)?
+                    encrypt_directory_with_password_and_files(&password, &cli.files)?;
                 }
             }
         }
@@ -1614,15 +1617,24 @@ fn run_command_on_files(command: &[String], password: Option<&str>) -> Result<()
     let mut modified_command = command.to_vec();
     for arg in modified_command.iter_mut() {
         if let Some(temp_path) = file_mappings.get(arg) {
-            *arg = temp_path.to_string_lossy().into_owned();
+            // Escape the path for shell usage
+            let escaped_path = escape(temp_path.to_string_lossy().into_owned().into());
+            *arg = escaped_path.to_string();
         }
     }
 
     // Run the command through the shell to support aliases and rc files
     let command_str = modified_command.join(" ");
+
+    // For wildcard expansion and proper shell handling, use -f flag for tcsh
+    let shell_args = if shell.ends_with("tcsh") {
+        vec!["-f", "-c", &command_str]
+    } else {
+        vec!["-c", &command_str]
+    };
+
     let output = Command::new(&shell)
-        .arg("-c")
-        .arg(&command_str)
+        .args(&shell_args)
         .current_dir(temp_path)
         .output()?;
 
@@ -1660,14 +1672,20 @@ fn run_test_mode(cli: &Cli) -> Result<()> {
     let password = cli.password.as_deref().unwrap_or("test_password");
     match &cli.command {
         Some(Commands::Encrypt { files }) => {
-            encrypt_directory_with_password_and_files(password, files)?
+            encrypt_directory_with_password_and_files(password, files)?;
         }
         Some(Commands::Decrypt { files }) => {
-            decrypt_directory_with_password_and_files(password, files)?
+            decrypt_directory_with_password_and_files(password, files)?;
         }
-        Some(Commands::Status) => status_directory()?,
-        Some(Commands::Run { command }) => run_command_on_files(command, Some(password))?,
-        None => encrypt_directory_with_password_and_files(password, &cli.files)?,
+        Some(Commands::Status) => {
+            status_directory()?;
+        }
+        Some(Commands::Run { command }) => {
+            run_command_on_files(command, Some(password))?;
+        }
+        None => {
+            encrypt_directory_with_password_and_files(password, &cli.files)?;
+        }
     }
 
     // Clean up
@@ -1719,9 +1737,9 @@ mod tests {
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
         // Create test files
-        fs::write("file1.txt", "content 1")?;
-        fs::write("file2.txt", "content 2")?;
-        fs::write("file3.txt", "content 3")?;
+        fs::write("file1.txt", "content 1\n")?;
+        fs::write("file2.txt", "content 2\n")?;
+        fs::write("file3.txt", "content 3\n")?;
 
         // First encrypt the files
         let password = "test_password";
@@ -1759,52 +1777,19 @@ mod tests {
         }
 
         // Test run command with cat -n
-        let cli = Cli {
-            command: Some(Commands::Run {
-                command: vec![
-                    "cat".to_string(),
-                    "-n".to_string(),
-                    encrypted_names.get("file1.txt").unwrap().to_string(),
-                    encrypted_names.get("file2.txt").unwrap().to_string(),
-                ],
-            }),
-            test_mode: false,
-            password: Some("test_password".to_string()),
-            files: vec![],
-        };
+        let mut command = vec!["cat".to_string(), "-n".to_string()];
+        command.push(encrypted_names.get("file1.txt").unwrap().to_string());
+        command.push(encrypted_names.get("file2.txt").unwrap().to_string());
 
-        // Run the command
-        match &cli.command {
-            Some(Commands::Run { command }) => {
-                run_command_on_files(command, Some("test_password"))?;
-            }
-            _ => panic!("Unexpected command"),
-        }
+        run_command_on_files(&command, Some("test_password"))?;
 
         // Test run command with grep -n
-        let cli = Cli {
-            command: Some(Commands::Run {
-                command: vec![
-                    "grep".to_string(),
-                    "-n".to_string(),
-                    "content".to_string(),
-                    encrypted_names.get("file1.txt").unwrap().to_string(),
-                    encrypted_names.get("file2.txt").unwrap().to_string(),
-                    encrypted_names.get("file3.txt").unwrap().to_string(),
-                ],
-            }),
-            test_mode: false,
-            password: Some("test_password".to_string()),
-            files: vec![],
-        };
+        let mut command = vec!["grep".to_string(), "-n".to_string(), "content".to_string()];
+        command.push(encrypted_names.get("file1.txt").unwrap().to_string());
+        command.push(encrypted_names.get("file2.txt").unwrap().to_string());
+        command.push(encrypted_names.get("file3.txt").unwrap().to_string());
 
-        // Run the command
-        match &cli.command {
-            Some(Commands::Run { command }) => {
-                run_command_on_files(command, Some("test_password"))?;
-            }
-            _ => panic!("Unexpected command"),
-        }
+        run_command_on_files(&command, Some("test_password"))?;
 
         // Clean up
         std::env::set_current_dir(original_dir)?;
@@ -2242,6 +2227,69 @@ mod tests {
         assert!(Path::new("test.txt").exists(), "File should be decrypted");
         assert_eq!(fs::read_to_string("test.txt")?, "test content");
 
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_command_special_chars() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (_temp_dir, original_dir) = setup_test_dir()?;
+
+        // Create test files with special characters
+        fs::write("file (1).txt", "content 1\n")?;
+        fs::write("file [2].txt", "content 2\n")?;
+        fs::write("file {3}.txt", "content 3\n")?;
+
+        // First encrypt the files
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(
+            password,
+            &[
+                normalize_test_path("file (1).txt"),
+                normalize_test_path("file [2].txt"),
+                normalize_test_path("file {3}.txt"),
+            ],
+        )?;
+
+        // Get the encrypted filenames from metadata
+        let meta_path = Path::new(SEAL_DIR).join(META_FILE);
+        let encrypted_metadata = fs::read(&meta_path)?;
+        let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
+        let meta_salt = fs::read(Path::new(SEAL_DIR).join(META_SALT_FILE))?;
+        let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+        let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
+        let decrypted_metadata = meta_cipher
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt metadata: {:?}", e))?;
+        let metadata_contents = String::from_utf8(decrypted_metadata)?;
+        let mut lines = metadata_contents.lines();
+        let _salt_str = lines.next().unwrap();
+        let all_files: HashMap<String, String> =
+            serde_json::from_str(&lines.collect::<Vec<_>>().join("\n"))?;
+
+        // Find the encrypted names for our files
+        let mut encrypted_names = Vec::new();
+        for (encrypted, original) in &all_files {
+            if original == "file (1).txt"
+                || original == "file [2].txt"
+                || original == "file {3}.txt"
+            {
+                encrypted_names.push(encrypted.to_string());
+            }
+        }
+
+        // Test run command with cat -n to number lines
+        let mut command = vec!["cat".to_string(), "-n".to_string()];
+        command.extend(encrypted_names.iter().cloned());
+
+        // Run the command
+        run_command_on_files(&command, Some("test_password"))?;
+
+        // Clean up
         std::env::set_current_dir(original_dir)?;
         Ok(())
     }

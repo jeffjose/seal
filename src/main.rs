@@ -763,7 +763,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
             Err(e) => {
                 println!("Warning: Could not get size of file {}: {}", path, e);
                 // Use a default size for files we can't get metadata for
-                total_size += 1024; // Assume 1KB
+                total_size += 1024;
                 file_sizes.insert(path.clone(), 1024);
             }
         }
@@ -1044,6 +1044,13 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                     "Successfully decrypted data, size: {} bytes",
                     decrypted_data.len()
                 );
+
+                // Create parent directories if needed
+                if let Some(parent) = Path::new(&original_file).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
 
                 // Write the decrypted data to the original file
                 if let Err(_e) = fs::write(&original_file, decrypted_data) {
@@ -1537,7 +1544,9 @@ mod tests {
 
         // Clean up
         std::env::set_current_dir(&original_dir)?;
-        fs::remove_dir_all(test_dir)?;
+        if test_dir.exists() {
+            fs::remove_dir_all(test_dir)?;
+        }
 
         Ok(())
     }
@@ -1683,6 +1692,219 @@ mod tests {
         );
 
         // Clean up
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_file() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create an empty file
+        fs::write("empty.txt", "")?;
+
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["empty.txt".to_string()])?;
+        decrypt_directory_with_password_and_files(password, &["empty.txt".to_string()])?;
+
+        assert!(Path::new("empty.txt").exists());
+        assert_eq!(fs::read_to_string("empty.txt")?, "");
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_corrupted_file() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create and encrypt a file
+        fs::write("test.txt", "test content")?;
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["test.txt".to_string()])?;
+
+        // Find the encrypted file
+        let encrypted_file = fs::read_dir(".")?
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().map_or(false, |ext| ext == EXTENSION))
+            .ok_or_else(|| anyhow::anyhow!("Encrypted file not found"))?;
+
+        // Corrupt the encrypted file
+        fs::write(encrypted_file.path(), "corrupted content")?;
+
+        // Attempt to decrypt should fail
+        assert!(
+            decrypt_directory_with_password_and_files(password, &["test.txt".to_string()]).is_err()
+        );
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_encryption_with_different_password() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create and encrypt a file
+        fs::write("test.txt", "test content")?;
+        let password1 = "password1";
+        encrypt_directory_with_password_and_files(password1, &["test.txt".to_string()])?;
+
+        // Try to decrypt with a different password
+        let password2 = "password2";
+        assert!(
+            decrypt_directory_with_password_and_files(password2, &["test.txt".to_string()])
+                .is_err()
+        );
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_salt() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create and encrypt a file
+        fs::write("test.txt", "test content")?;
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["test.txt".to_string()])?;
+
+        // Verify metadata salt file exists
+        assert!(Path::new(SEAL_DIR).join(META_SALT_FILE).exists());
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_large_file() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create a large file (4MB)
+        let large_content = vec![b'A'; 4 * 1024 * 1024];
+        fs::write("large.txt", &large_content)?;
+
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["large.txt".to_string()])?;
+        decrypt_directory_with_password_and_files(password, &["large.txt".to_string()])?;
+
+        assert!(Path::new("large.txt").exists());
+        assert_eq!(fs::read("large.txt")?, large_content);
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_salt_required() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create and encrypt a file
+        fs::write("test.txt", "test content")?;
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["test.txt".to_string()])?;
+
+        // Remove the metadata salt file
+        fs::remove_file(Path::new(SEAL_DIR).join(META_SALT_FILE))?;
+
+        // Attempt to decrypt should fail
+        assert!(
+            decrypt_directory_with_password_and_files(password, &["test.txt".to_string()]).is_err()
+        );
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_encrypted_file() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create and encrypt a file
+        fs::write("test.txt", "test content")?;
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["test.txt".to_string()])?;
+
+        // Remove the encrypted file but keep metadata
+        let encrypted_file = fs::read_dir(".")?
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().map_or(false, |ext| ext == EXTENSION))
+            .ok_or_else(|| anyhow::anyhow!("Encrypted file not found"))?;
+        fs::remove_file(encrypted_file.path())?;
+
+        // Attempt to decrypt should fail
+        assert!(
+            decrypt_directory_with_password_and_files(password, &["test.txt".to_string()]).is_err()
+        );
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_subdirectory_encryption_decryption() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        // Create a subdirectory with a file
+        fs::create_dir("subdir")?;
+        fs::write("subdir/test.txt", "test content")?;
+
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &["subdir/test.txt".to_string()])?;
+        decrypt_directory_with_password_and_files(password, &["subdir/test.txt".to_string()])?;
+
+        assert!(Path::new("subdir/test.txt").exists());
+        assert_eq!(fs::read_to_string("subdir/test.txt")?, "test content");
+
         std::env::set_current_dir(original_dir)?;
         Ok(())
     }

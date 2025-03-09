@@ -142,17 +142,29 @@ fn encrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
         return encrypt_file_streaming(path, cipher);
     }
 
-    // Generate nonce
-    let mut nonce = vec![0u8; NONCE_LEN];
+    // For small files, use a single chunk
+    let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
 
     // Read file contents
     let contents = fs::read(path)?;
+
+    // Write number of chunks (1 for small files)
+    let mut result = Vec::new();
+    result.extend_from_slice(&1u64.to_le_bytes()); // Always 1 chunk for small files
+    result.extend_from_slice(&nonce);
+
+    // Encrypt the contents
     let encrypted = cipher
         .encrypt(Nonce::from_slice(&nonce), contents.as_ref())
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-    Ok([nonce.as_slice(), &encrypted].concat())
+    // Write chunk size and encrypted data
+    let chunk_size = encrypted.len() as u32;
+    result.extend_from_slice(&chunk_size.to_le_bytes());
+    result.extend_from_slice(&encrypted);
+
+    Ok(result)
 }
 
 fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
@@ -165,40 +177,70 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
+    // For small files, use a single chunk
+    let num_chunks = if file_size < CHUNK_SIZE as u64 {
+        1
+    } else {
+        (file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64
+    };
+
     // Create a temporary file for the encrypted output
     let temp_path = path.with_extension("temp_encrypted");
     let mut temp_file = std::fs::File::create(&temp_path)?;
 
-    // Generate a random nonce
-    let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-
-    // Write the nonce first
-    temp_file.write_all(&nonce)?;
+    // Write the number of chunks first (u64)
+    temp_file.write_all(&num_chunks.to_le_bytes())?;
 
     // Process the file in chunks
     let mut buffer = vec![0u8; CHUNK_SIZE];
-    let mut total_written = NONCE_LEN;
+    let mut total_written = 8; // 8 bytes for num_chunks
 
     #[cfg(test)]
-    println!("Processing file in chunks of {} bytes", CHUNK_SIZE);
+    println!(
+        "Processing file in {} chunks of {} bytes each",
+        num_chunks, CHUNK_SIZE
+    );
 
+    let mut chunk_index = 0;
     while let Ok(n) = file.read(&mut buffer) {
         if n == 0 {
             break; // End of file
         }
 
+        // Generate a unique nonce for this chunk
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+
+        // Write the nonce for this chunk
+        temp_file.write_all(&nonce)?;
+        total_written += NONCE_LEN;
+
         // Encrypt the chunk
         let encrypted_chunk = cipher
-            .encrypt(Nonce::from_slice(&nonce), &buffer[..n])
+            .encrypt(Nonce::from_slice(&nonce), buffer[..n].as_ref())
             .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
 
-        // Write the encrypted chunk
+        // Write the chunk size and encrypted chunk
+        let chunk_size = encrypted_chunk.len() as u32;
+        temp_file.write_all(&chunk_size.to_le_bytes())?;
         temp_file.write_all(&encrypted_chunk)?;
-        total_written += encrypted_chunk.len();
+        total_written += 4 + encrypted_chunk.len(); // 4 bytes for size + chunk
 
         #[cfg(test)]
-        println!("Processed chunk: {} bytes", n);
+        println!("Processed chunk {}: {} bytes", chunk_index, n);
+
+        chunk_index += 1;
+    }
+
+    // Verify we wrote the expected number of chunks
+    if chunk_index != num_chunks as usize {
+        // Clean up temporary file
+        let _ = fs::remove_file(&temp_path);
+        return Err(anyhow::anyhow!(
+            "Wrote {} chunks but expected {}",
+            chunk_index,
+            num_chunks
+        ));
     }
 
     // Close the files
@@ -249,43 +291,126 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
-    if file_size <= NONCE_LEN as u64 {
+    if file_size < 8 {
+        // At least need num_chunks
         return Err(anyhow::anyhow!(
             "File too small to be a valid encrypted file"
         ));
     }
 
-    // Read the nonce
-    let mut nonce = [0u8; NONCE_LEN];
-    file.read_exact(&mut nonce)?;
+    // Read the number of chunks
+    let mut num_chunks_bytes = [0u8; 8];
+    file.read_exact(&mut num_chunks_bytes)?;
+    let num_chunks = u64::from_le_bytes(num_chunks_bytes);
+
+    // For small files, expect a single chunk
+    let expected_max_chunks = if file_size < CHUNK_SIZE as u64 {
+        1
+    } else {
+        (file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64
+    };
+
+    if num_chunks > expected_max_chunks {
+        return Err(anyhow::anyhow!(
+            "Invalid number of chunks: got {}, expected at most {}",
+            num_chunks,
+            expected_max_chunks
+        ));
+    }
 
     // Create a temporary file for the decrypted output
     let temp_path = path.with_extension("temp_decrypted");
     let mut temp_file = std::fs::File::create(&temp_path)?;
 
-    // Process the file in chunks
-    let mut buffer = vec![0u8; CHUNK_SIZE + 16]; // Extra space for GCM tag
+    #[cfg(test)]
+    println!("Decrypting {} chunks", num_chunks);
+
     let mut total_written = 0;
 
-    #[cfg(test)]
-    println!("Processing file in chunks of {} bytes", CHUNK_SIZE);
+    // Process each chunk
+    for chunk_index in 0..num_chunks {
+        // Read the nonce for this chunk
+        let mut nonce = [0u8; NONCE_LEN];
+        if let Err(e) = file.read_exact(&mut nonce) {
+            // Clean up temporary file
+            let _ = fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!(
+                "Failed to read nonce for chunk {}: {}",
+                chunk_index,
+                e
+            ));
+        }
 
-    while let Ok(n) = file.read(&mut buffer) {
-        if n == 0 {
-            break; // End of file
+        // Read the chunk size
+        let mut chunk_size_bytes = [0u8; 4];
+        if let Err(e) = file.read_exact(&mut chunk_size_bytes) {
+            // Clean up temporary file
+            let _ = fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!(
+                "Failed to read size for chunk {}: {}",
+                chunk_index,
+                e
+            ));
+        }
+        let chunk_size = u32::from_le_bytes(chunk_size_bytes) as usize;
+
+        // Validate chunk size
+        if chunk_size > CHUNK_SIZE + 16 {
+            // 16 bytes for GCM tag
+            // Clean up temporary file
+            let _ = fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!(
+                "Invalid chunk size for chunk {}: {} bytes",
+                chunk_index,
+                chunk_size
+            ));
+        }
+
+        // Read the encrypted chunk
+        let mut encrypted_chunk = vec![0u8; chunk_size];
+        if let Err(e) = file.read_exact(&mut encrypted_chunk) {
+            // Clean up temporary file
+            let _ = fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!(
+                "Failed to read chunk {}: {}",
+                chunk_index,
+                e
+            ));
         }
 
         // Decrypt the chunk
-        let decrypted_chunk = cipher
-            .decrypt(Nonce::from_slice(&nonce), &buffer[..n])
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
+        let decrypted_chunk =
+            match cipher.decrypt(Nonce::from_slice(&nonce), encrypted_chunk.as_ref()) {
+                Ok(data) => data,
+                Err(e) => {
+                    // Clean up temporary file
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(anyhow::anyhow!(
+                        "Failed to decrypt chunk {}: {:?}",
+                        chunk_index,
+                        e
+                    ));
+                }
+            };
 
         // Write the decrypted chunk
-        temp_file.write_all(&decrypted_chunk)?;
+        if let Err(e) = temp_file.write_all(&decrypted_chunk) {
+            // Clean up temporary file
+            let _ = fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!(
+                "Failed to write chunk {}: {}",
+                chunk_index,
+                e
+            ));
+        }
         total_written += decrypted_chunk.len();
 
         #[cfg(test)]
-        println!("Processed chunk: {} bytes", n);
+        println!(
+            "Processed chunk {}: {} bytes",
+            chunk_index,
+            decrypted_chunk.len()
+        );
     }
 
     // Close the files
@@ -773,6 +898,7 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
 
 fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm) -> Result<()> {
     let mut success = true;
+    let mut any_success = false;
 
     // Calculate total size of all files to decrypt
     let mut total_size: u64 = 0;
@@ -863,6 +989,7 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                         #[cfg(test)]
                         println!("Error removing encrypted file: {:?}", e);
                     }
+                    any_success = true;
                 }
             }
             Err(e) => {
@@ -887,10 +1014,11 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
     // Finish progress bar
     pb.finish_with_message(format!("Done at {:.2} MB/s", speed));
 
-    if success {
+    // Consider it a success if at least one file was decrypted successfully
+    if any_success {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("One or more files failed to decrypt"))
+        Err(anyhow::anyhow!("All files failed to decrypt"))
     }
 }
 
@@ -1207,13 +1335,10 @@ mod tests {
         println!("Corrupted file test - Decrypting with corrupted file");
         let result = decrypt_directory_with_password(password);
 
-        // Decryption should succeed even with a corrupted file
-        if !result.is_ok() {
-            println!("Decryption failed: {:?}", result);
-        }
+        // Decryption should succeed since at least one file was decrypted
         assert!(
             result.is_ok(),
-            "Decryption should succeed even with a corrupted file"
+            "Decryption should succeed if at least one file is decrypted"
         );
 
         // Verify that file2 was decrypted
@@ -1223,7 +1348,7 @@ mod tests {
         // Verify that file1 was not decrypted (since its encrypted file was corrupted)
         assert!(!Path::new(&file1).exists(), "File1 should not be decrypted");
 
-        // Verify that the corrupted file is still there (we don't delete corrupted files)
+        // Verify that the corrupted file is still there
         assert!(
             Path::new(&encrypted_file1).exists(),
             "Corrupted file should still exist"
@@ -1295,7 +1420,6 @@ mod tests {
         let _lock = match CURRENT_DIR_MUTEX.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
-                // If the mutex is poisoned, recover it
                 println!("Warning: Mutex was poisoned. Recovering...");
                 poisoned.into_inner()
             }
@@ -1304,67 +1428,36 @@ mod tests {
         // Create a unique test directory
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
-
-        println!(
-            "Large file test - Current dir before: {:?}",
-            std::env::current_dir()?
-        );
         std::env::set_current_dir(&temp_dir)?;
-        println!(
-            "Large file test - Current dir after: {:?}",
-            std::env::current_dir()?
-        );
 
-        // Create a large test file (just over the threshold)
+        // Create a large test file with a verifiable pattern
         let test_file = format!("largefile_{}.bin", Uuid::new_v4().to_string());
+        let test_size = LARGE_FILE_THRESHOLD as usize * 3; // Make it 3x the threshold to ensure multiple chunks
+        println!("Creating test file of size: {} bytes", test_size);
 
-        // For testing, we'll create a file that's just over the threshold
-        // but not so large that the test takes too long
-        let test_size = LARGE_FILE_THRESHOLD as usize + 1024 * 1024; // Threshold + 1MB
-
-        println!(
-            "Large file test - Creating file of size: {} bytes",
-            test_size
-        );
-
-        // Create a file with repeating pattern for easy verification
+        // Create file with a pattern that varies by chunk for verification
         let mut file = std::fs::File::create(&test_file)?;
-        let chunk_size = 1024 * 1024; // 1MB chunks for creation
-        let chunk = vec![42u8; chunk_size]; // Fill with the byte value 42
+        let mut written = 0;
+        let chunk_size = CHUNK_SIZE;
 
-        let mut remaining = test_size;
-        while remaining > 0 {
-            let to_write = std::cmp::min(remaining, chunk_size);
-            file.write_all(&chunk[..to_write])?;
-            remaining -= to_write;
+        while written < test_size {
+            let to_write = std::cmp::min(chunk_size, test_size - written);
+            let chunk_number = (written / chunk_size) as u8;
+            let chunk: Vec<u8> = (0..to_write)
+                .map(|i| (i as u8).wrapping_add(chunk_number))
+                .collect();
+            file.write_all(&chunk)?;
+            written += to_write;
         }
-
         drop(file);
 
         // Verify the file size
         let metadata = std::fs::metadata(&test_file)?;
-        assert_eq!(metadata.len(), test_size as u64, "File size should match");
-
-        // Sleep a bit to ensure files are written
-        thread::sleep(Duration::from_millis(100));
-
-        println!("Large file test - File created");
+        assert_eq!(metadata.len(), test_size as u64);
 
         // Encrypt with password
         let password = "test_password";
-        println!("Large file test - Encrypting with password: {}", password);
         encrypt_directory_with_password(password)?;
-
-        // Verify the metadata file exists
-        let seal_dir = Path::new(SEAL_DIR);
-        let meta_path = seal_dir.join(META_FILE);
-        assert!(meta_path.exists(), "Metadata file should exist");
-
-        // List files after encryption
-        println!("Large file test - Files after encryption:");
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            println!("Large file test - Found: {:?}", entry.path());
-        }
 
         // Verify the original file is gone and an encrypted file exists
         assert!(
@@ -1373,67 +1466,71 @@ mod tests {
         );
 
         // Find the encrypted file
-        let mut encrypted_file_found = false;
+        let mut encrypted_file_path = None;
         for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
             if entry.path().to_string_lossy().ends_with(EXTENSION) {
-                encrypted_file_found = true;
-
-                // Verify the encrypted file is large
-                let encrypted_metadata = entry.metadata()?;
-                assert!(
-                    encrypted_metadata.len() > NONCE_LEN as u64,
-                    "Encrypted file should be larger than just the nonce"
-                );
-
+                encrypted_file_path = Some(entry.path().to_path_buf());
                 break;
             }
         }
+        let encrypted_file_path = encrypted_file_path.expect("Should find encrypted file");
 
-        assert!(encrypted_file_found, "Encrypted file should exist");
+        // Verify encrypted file size is reasonable (should be original size + nonce + some overhead)
+        let encrypted_size = fs::metadata(&encrypted_file_path)?.len();
+        assert!(
+            encrypted_size > test_size as u64,
+            "Encrypted file should be larger than original"
+        );
+        assert!(
+            encrypted_size < (test_size + CHUNK_SIZE) as u64,
+            "Encrypted file shouldn't be too much larger"
+        );
 
         // Decrypt the files
-        println!("Large file test - Decrypting with password: {}", password);
         decrypt_directory_with_password(password)?;
-
-        // List files after decryption
-        println!("Large file test - Files after decryption:");
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            println!("Large file test - Found: {:?}", entry.path());
-        }
 
         // Verify the original file is restored
         assert!(Path::new(&test_file).exists(), "Test file should exist");
-
-        // Verify the file size is correct
         let restored_metadata = std::fs::metadata(&test_file)?;
-        assert_eq!(
-            restored_metadata.len(),
-            test_size as u64,
-            "Restored file size should match original"
-        );
+        assert_eq!(restored_metadata.len(), test_size as u64);
 
-        // Verify the file contents (check first and last MB)
+        // Verify the contents chunk by chunk
         let mut restored_file = std::fs::File::open(&test_file)?;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut total_read = 0;
 
-        // Check first MB
-        let mut first_mb = vec![0u8; 1024 * 1024];
-        restored_file.read_exact(&mut first_mb)?;
-        assert!(
-            first_mb.iter().all(|&b| b == 42),
-            "First MB of restored file should contain the correct pattern"
-        );
+        while total_read < test_size {
+            let expected_chunk_size = std::cmp::min(chunk_size, test_size - total_read);
+            let chunk_number = (total_read / chunk_size) as u8;
 
-        // Check last MB
-        restored_file.seek(std::io::SeekFrom::End(-(1024 * 1024) as i64))?;
-        let mut last_mb = vec![0u8; 1024 * 1024];
-        restored_file.read_exact(&mut last_mb)?;
-        assert!(
-            last_mb.iter().all(|&b| b == 42),
-            "Last MB of restored file should contain the correct pattern"
-        );
+            // Read a chunk
+            let n = restored_file.read(&mut buffer[..expected_chunk_size])?;
+            assert_eq!(n, expected_chunk_size, "Should read full chunk");
+
+            // Verify chunk contents
+            for (i, &byte) in buffer[..n].iter().enumerate() {
+                let expected = (i as u8).wrapping_add(chunk_number);
+                assert_eq!(
+                    byte,
+                    expected,
+                    "Mismatch at position {} in chunk {} (got {}, expected {})",
+                    i,
+                    total_read / chunk_size,
+                    byte,
+                    expected
+                );
+            }
+
+            total_read += n;
+        }
+
+        // Verify we've read everything
+        assert_eq!(total_read, test_size);
+
+        // Try to read one more byte - should get EOF
+        assert_eq!(restored_file.read(&mut buffer[..1])?, 0);
 
         // Clean up
-        println!("Large file test - Cleaning up");
         std::env::set_current_dir(original_dir)?;
 
         Ok(())

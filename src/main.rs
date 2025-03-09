@@ -11,9 +11,8 @@ use nanoid::nanoid;
 use rand::{rngs::OsRng, RngCore};
 use rpassword::read_password;
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
-use uuid::Uuid;
 use walkdir::WalkDir;
 
 const SALT_LEN: usize = 32;
@@ -25,8 +24,8 @@ const FILENAME_LENGTH: usize = 16; // Length of random filenames
 const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz"; // Only lowercase letters and numbers
 
 // Constants for streaming
-const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+// const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+// const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -51,6 +50,9 @@ enum Commands {
     /// Decrypt previously encrypted files
     #[command(alias = "d", alias = "x")]
     Decrypt,
+    /// Show status of encrypted and unencrypted files
+    #[command(alias = "st")]
+    Status,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,6 +85,7 @@ fn main() -> Result<()> {
         match cli.command {
             Some(Commands::Encrypt) | None => encrypt_directory_with_password(password)?,
             Some(Commands::Decrypt) => decrypt_directory_with_password(password)?,
+            Some(Commands::Status) => status_directory()?,
         }
 
         // Clean up
@@ -108,6 +111,7 @@ fn main() -> Result<()> {
                 decrypt_directory()?
             }
         }
+        Some(Commands::Status) => status_directory()?,
     }
 
     Ok(())
@@ -128,142 +132,33 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn encrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
-    let file_size = fs::metadata(path)?.len();
-
     // Generate nonce
     let mut nonce = vec![0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
 
-    // For small files, use the original in-memory approach
-    if file_size < LARGE_FILE_THRESHOLD {
-        let contents = fs::read(path)?;
-        let encrypted = cipher
-            .encrypt(Nonce::from_slice(&nonce), contents.as_ref())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+    // Read file contents
+    let contents = fs::read(path)?;
+    let encrypted = cipher
+        .encrypt(Nonce::from_slice(&nonce), contents.as_ref())
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-        return Ok([nonce.as_slice(), &encrypted].concat());
-    }
-
-    // For large files, use a streaming approach
-    #[cfg(test)]
-    println!(
-        "Using streaming encryption for large file: {:?} ({} bytes)",
-        path, file_size
-    );
-
-    // Create a temporary file for the encrypted output
-    let temp_dir = std::env::temp_dir();
-    let temp_file_path = temp_dir.join(format!("seal_temp_{}", Uuid::new_v4().to_string()));
-    let mut temp_file = fs::File::create(&temp_file_path)?;
-
-    // Write the nonce at the beginning
-    temp_file.write_all(&nonce)?;
-
-    // Open the input file
-    let mut file = fs::File::open(path)?;
-    let mut buffer = vec![0; CHUNK_SIZE];
-
-    // Process the file in chunks
-    loop {
-        let bytes_read = file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break; // End of file
-        }
-
-        // Encrypt this chunk
-        let chunk_to_encrypt = &buffer[..bytes_read];
-        let encrypted_chunk = cipher
-            .encrypt(Nonce::from_slice(&nonce), chunk_to_encrypt)
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-
-        // Write the encrypted chunk
-        temp_file.write_all(&encrypted_chunk)?;
-
-        if bytes_read < CHUNK_SIZE {
-            break; // Last chunk
-        }
-    }
-
-    // Read the entire encrypted file back
-    let encrypted_data = fs::read(&temp_file_path)?;
-
-    // Clean up the temporary file
-    fs::remove_file(&temp_file_path)?;
-
-    Ok(encrypted_data)
+    Ok([nonce.as_slice(), &encrypted].concat())
 }
 
 #[allow(dead_code)]
 fn decrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
-    let file_size = fs::metadata(path)?.len();
-
-    // For small files, use the original in-memory approach
-    if file_size < LARGE_FILE_THRESHOLD {
-        let contents = fs::read(path)?;
-        if contents.len() <= NONCE_LEN {
-            return Err(anyhow::anyhow!(
-                "File too small to be a valid encrypted file"
-            ));
-        }
-
-        let (nonce, ciphertext) = contents.split_at(NONCE_LEN);
-
-        return cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e));
+    let contents = fs::read(path)?;
+    if contents.len() <= NONCE_LEN {
+        return Err(anyhow::anyhow!(
+            "File too small to be a valid encrypted file"
+        ));
     }
 
-    // For large files, use a streaming approach
-    #[cfg(test)]
-    println!(
-        "Using streaming decryption for large file: {:?} ({} bytes)",
-        path, file_size
-    );
+    let (nonce, ciphertext) = contents.split_at(NONCE_LEN);
 
-    // Open the encrypted file
-    let mut file = fs::File::open(path)?;
-
-    // Read the nonce
-    let mut nonce = vec![0u8; NONCE_LEN];
-    file.read_exact(&mut nonce)?;
-
-    // Create a temporary file for the decrypted output
-    let temp_dir = std::env::temp_dir();
-    let temp_file_path = temp_dir.join(format!("seal_temp_{}", Uuid::new_v4().to_string()));
-    let mut temp_file = fs::File::create(&temp_file_path)?;
-
-    // Process the file in chunks
-    let mut buffer = vec![0; CHUNK_SIZE + 16]; // Add some extra space for the auth tag
-
-    // Process the file in chunks
-    loop {
-        let bytes_read = file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break; // End of file
-        }
-
-        // Decrypt this chunk
-        let chunk_to_decrypt = &buffer[..bytes_read];
-        let decrypted_chunk = match cipher.decrypt(Nonce::from_slice(&nonce), chunk_to_decrypt) {
-            Ok(data) => data,
-            Err(e) => return Err(anyhow::anyhow!("Decryption failed: {}", e)),
-        };
-
-        // Write the decrypted chunk
-        temp_file.write_all(&decrypted_chunk)?;
-
-        if bytes_read < CHUNK_SIZE + 16 {
-            break; // Last chunk
-        }
-    }
-
-    // Read the entire decrypted file back
-    let decrypted_data = fs::read(&temp_file_path)?;
-
-    // Clean up the temporary file
-    fs::remove_file(&temp_file_path)?;
-
-    Ok(decrypted_data)
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
 }
 
 /// Normalize a path string to use forward slashes and remove leading ./
@@ -851,6 +746,52 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
     println!("Done.");
 
     // Metadata files are now cleaned up in the decrypt_directory_with_password function
+
+    Ok(())
+}
+
+/// Show status of encrypted and unencrypted files in the current directory
+fn status_directory() -> Result<()> {
+    // Check if .seal directory exists
+    let seal_dir = Path::new(SEAL_DIR);
+    let meta_path = seal_dir.join(META_FILE);
+
+    let has_metadata = meta_path.exists();
+
+    // Count encrypted files (files with .sealed extension)
+    let mut encrypted_files_count = 0;
+
+    for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() && path.extension().map_or(false, |ext| ext == EXTENSION) {
+            encrypted_files_count += 1;
+        }
+    }
+
+    // Count unencrypted files (excluding .seal directory and .sealed files)
+    let mut unencrypted_files_count = 0;
+
+    for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file()
+            && !path.extension().map_or(false, |ext| ext == EXTENSION)
+            && !path.to_string_lossy().contains(SEAL_DIR)
+        {
+            unencrypted_files_count += 1;
+        }
+    }
+
+    // Print status information in a clean format
+    if has_metadata {
+        println!("✓ SEALED");
+    } else {
+        println!("✗ NOT SEALED");
+    }
+
+    println!("");
+    println!("FILES:");
+    println!("  {} encrypted", encrypted_files_count);
+    println!("  {} unencrypted", unencrypted_files_count);
 
     Ok(())
 }

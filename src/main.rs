@@ -206,6 +206,49 @@ fn create_encrypted_path(original_path: &str) -> Result<String> {
     Ok(encrypted_filename)
 }
 
+/// Recursively remove empty directories
+fn remove_empty_directories(dir: &Path) -> Result<bool> {
+    // Skip if it's not a directory or doesn't exist
+    if !dir.is_dir() || !dir.exists() {
+        return Ok(false);
+    }
+
+    // Skip special directories
+    let dir_str = dir.to_string_lossy();
+    if dir_str.contains(SEAL_DIR) || dir_str.starts_with("./.") {
+        return Ok(false);
+    }
+
+    let mut is_empty = true;
+
+    // Check all entries in the directory
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Recursively check subdirectories
+            let subdir_empty = remove_empty_directories(&path)?;
+            if !subdir_empty {
+                is_empty = false;
+            }
+        } else {
+            // If there's a file, the directory is not empty
+            is_empty = false;
+        }
+    }
+
+    // If the directory is empty, remove it
+    if is_empty {
+        #[cfg(test)]
+        println!("Removing empty directory: {:?}", dir);
+
+        fs::remove_dir(dir)?;
+    }
+
+    Ok(is_empty)
+}
+
 fn encrypt_directory() -> Result<()> {
     encrypt_directory_with_password(&get_password("Enter password: ")?)
 }
@@ -329,6 +372,9 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
                 // Write the encrypted metadata file to the new location
                 fs::write(meta_path, [nonce.as_slice(), &encrypted_metadata].concat())?;
 
+                // Remove empty directories
+                remove_empty_directories(Path::new("."))?;
+
                 return Ok(());
             }
         } else {
@@ -378,6 +424,9 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
 
     // Finish progress bar
     pb.finish_and_clear();
+
+    // Remove empty directories after all files have been encrypted
+    remove_empty_directories(Path::new("."))?;
 
     // Save metadata as a string first
     let metadata_string = format!(
@@ -992,6 +1041,141 @@ mod tests {
 
         // Clean up
         println!("Cleaning up");
+        std::env::set_current_dir(original_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_directories_removed() -> Result<()> {
+        // Acquire the mutex to ensure exclusive access to the current directory
+        let _lock = CURRENT_DIR_MUTEX.lock().unwrap();
+
+        // Create a unique test directory
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+
+        println!(
+            "Empty dir test - Current dir before: {:?}",
+            std::env::current_dir()?
+        );
+        std::env::set_current_dir(&temp_dir)?;
+        println!(
+            "Empty dir test - Current dir after: {:?}",
+            std::env::current_dir()?
+        );
+
+        // Create a nested directory structure with files
+        let subdir1 = format!("subdir1_{}", Uuid::new_v4().to_string());
+        let subdir2 = format!("subdir2_{}", Uuid::new_v4().to_string());
+        let empty_dir = format!("empty_dir_{}", Uuid::new_v4().to_string());
+        let nested_empty_dir = format!("{}/nested_empty_{}", subdir1, Uuid::new_v4().to_string());
+
+        // Create directories
+        fs::create_dir_all(&format!("{}/{}", subdir1, subdir2))?;
+        fs::create_dir(&empty_dir)?; // This directory will remain empty
+        fs::create_dir(&nested_empty_dir)?; // This nested directory will remain empty
+
+        // Create files
+        let root_file = format!("root_file_{}.txt", Uuid::new_v4().to_string());
+        let file1 = format!("file1_{}.txt", Uuid::new_v4().to_string());
+        let file2 = format!("file2_{}.txt", Uuid::new_v4().to_string());
+
+        fs::write(&root_file, "Root file content")?;
+        fs::write(format!("{}/{}", subdir1, file1), "Subdir file content")?;
+        fs::write(
+            format!("{}/{}/{}", subdir1, subdir2, file2),
+            "Nested subdir file content",
+        )?;
+
+        // Sleep a bit to ensure files are written
+        thread::sleep(Duration::from_millis(100));
+
+        println!("Empty dir test - Files and directories created");
+
+        // List files and directories to verify they exist
+        println!("Empty dir test - Before encryption:");
+        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+            println!("Found: {:?}", entry.path());
+        }
+
+        // Verify empty directories exist before encryption
+        assert!(
+            Path::new(&empty_dir).exists(),
+            "Empty directory should exist before encryption"
+        );
+        assert!(
+            Path::new(&nested_empty_dir).exists(),
+            "Nested empty directory should exist before encryption"
+        );
+
+        // Encrypt with password
+        let password = "test_password";
+        println!("Empty dir test - Encrypting with password: {}", password);
+        encrypt_directory_with_password(password)?;
+
+        println!("Empty dir test - Encryption complete");
+
+        // List files and directories after encryption
+        println!("Empty dir test - After encryption:");
+        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+            println!("Found: {:?}", entry.path());
+        }
+
+        // Verify empty directories are removed after encryption
+        assert!(
+            !Path::new(&empty_dir).exists(),
+            "Empty directory should be removed after encryption"
+        );
+        assert!(
+            !Path::new(&nested_empty_dir).exists(),
+            "Nested empty directory should be removed after encryption"
+        );
+
+        // Verify original directories with files are also removed
+        assert!(
+            !Path::new(&subdir1).exists(),
+            "Original directory should be removed after encryption"
+        );
+
+        // Decrypt with the same password
+        println!("Empty dir test - Decrypting with password: {}", password);
+        decrypt_directory_with_password(password)?;
+
+        println!("Empty dir test - Decryption complete");
+
+        // List files and directories after decryption
+        println!("Empty dir test - After decryption:");
+        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+            println!("Found: {:?}", entry.path());
+        }
+
+        // Verify original files and directories are restored
+        assert!(
+            Path::new(&root_file).exists(),
+            "Root file should exist after decryption"
+        );
+        assert!(
+            Path::new(&format!("{}/{}", subdir1, file1)).exists(),
+            "Subdir file should exist after decryption"
+        );
+        assert!(
+            Path::new(&format!("{}/{}/{}", subdir1, subdir2, file2)).exists(),
+            "Nested subdir file should exist after decryption"
+        );
+
+        // Verify empty directories are not restored (they weren't in the metadata)
+        assert!(
+            !Path::new(&empty_dir).exists(),
+            "Empty directory should not be restored after decryption"
+        );
+        assert!(
+            !Path::new(&nested_empty_dir).exists(),
+            "Nested empty directory should not be restored after decryption"
+        );
+
+        // Clean up
+        println!("Empty dir test - Cleaning up");
         std::env::set_current_dir(original_dir)?;
 
         Ok(())

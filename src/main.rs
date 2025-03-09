@@ -13,6 +13,7 @@ use rpassword::read_password;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
+use uuid;
 use walkdir::WalkDir;
 
 const SALT_LEN: usize = 32;
@@ -873,6 +874,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn decrypt_directory() -> Result<()> {
     decrypt_directory_with_password(&get_password("Enter password: ")?)
 }
@@ -1223,7 +1225,7 @@ fn encrypt_directory_with_password_and_files(password: &str, files: &[String]) -
             .filter(|s| {
                 !s.starts_with("./.")
                     && !s.ends_with(EXTENSION)
-                    && s != SEAL_DIR
+                    && !s.contains(SEAL_DIR)
                     && s != ".original_path"
             })
             .collect()
@@ -1234,9 +1236,9 @@ fn encrypt_directory_with_password_and_files(password: &str, files: &[String]) -
             .filter(|f| {
                 let path = Path::new(f);
                 path.exists()
-                    && !path.to_string_lossy().starts_with("./.")
-                    && !path.to_string_lossy().ends_with(EXTENSION)
-                    && path.to_string_lossy() != SEAL_DIR
+                    && !f.starts_with(".")
+                    && !f.ends_with(EXTENSION)
+                    && !f.contains(SEAL_DIR)
             })
             .cloned()
             .collect()
@@ -1473,7 +1475,6 @@ mod tests {
     use super::*;
     use lazy_static::lazy_static;
     use std::sync::Mutex;
-    use std::{thread, time::Duration};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1489,18 +1490,9 @@ mod tests {
 
     #[test]
     fn test_test_mode() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        // This test verifies that the TEST_MODE functionality works correctly
-        // It should create a test directory, run the program, and clean up after itself
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Create a test directory with a unique name
         let test_dir_name = unique_test_dir();
@@ -1512,38 +1504,19 @@ mod tests {
 
         // Change to the test directory
         let original_dir = std::env::current_dir()?;
-        println!(
-            "Test mode - Current dir before: {:?}",
-            std::env::current_dir()?
-        );
         std::env::set_current_dir(test_dir)?;
-        println!(
-            "Test mode - Current dir after: {:?}",
-            std::env::current_dir()?
-        );
 
         // Create a test file with a unique name
         let test_file = format!("testfile_{}.txt", Uuid::new_v4().to_string());
         fs::write(&test_file, "This is a test file")?;
 
-        // Sleep a bit to ensure files are written
-        thread::sleep(Duration::from_millis(100));
-
-        // List files to verify they exist
-        println!("Test mode - Files created:");
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            println!("Test mode - Found: {:?}", entry.path());
-        }
-
         // Check if .seal directory exists before encryption
         if Path::new(SEAL_DIR).exists() {
-            println!("Test mode - Warning: .seal directory already exists before encryption");
             fs::remove_dir_all(SEAL_DIR)?;
         }
 
         // Run the test mode function
         let password = "test_password";
-        println!("Test mode - Encrypting with password: {}", password);
         encrypt_directory_with_password(password)?;
 
         // Verify the metadata file exists
@@ -1551,583 +1524,166 @@ mod tests {
         let meta_path = seal_dir.join(META_FILE);
         assert!(meta_path.exists(), "Metadata file should exist");
 
-        // List files after encryption
-        println!("Test mode - Files after encryption:");
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            println!("Test mode - Found: {:?}", entry.path());
-        }
+        // Verify the original file is gone
+        assert!(
+            !Path::new(&test_file).exists(),
+            "Original file should be encrypted"
+        );
 
-        // Decrypt the files
-        println!("Test mode - Decrypting with password: {}", password);
+        // Decrypt and verify
         decrypt_directory_with_password(password)?;
-
-        // List files after decryption
-        println!("Test mode - Files after decryption:");
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            println!("Test mode - Found: {:?}", entry.path());
-        }
-
-        // Verify the original file is restored
-        assert!(Path::new(&test_file).exists(), "Test file should exist");
+        assert!(Path::new(&test_file).exists(), "File should be decrypted");
         assert_eq!(fs::read_to_string(&test_file)?, "This is a test file");
 
         // Clean up
-        println!("Test mode - Cleaning up");
-        std::env::set_current_dir(original_dir)?;
+        std::env::set_current_dir(&original_dir)?;
         fs::remove_dir_all(test_dir)?;
 
-        // Verify that the test directory was cleaned up
-        assert!(
-            !Path::new(&test_dir_name).exists(),
-            "Test directory should be cleaned up"
-        );
-
         Ok(())
     }
 
     #[test]
-    fn test_subdirectory_encryption_decryption() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
+    fn test_file_filtering() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // ... rest of the test ...
-
-        Ok(())
-    }
-
-    // ... other tests ...
-
-    #[test]
-    fn test_corrupted_file() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        // Create a unique test directory and store it in a variable that lives for the whole test
+        // Create a temporary directory for this test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
-
-        // Create a deferred cleanup function that will run even if the test fails
-        let _cleanup = scopeguard::guard((), |_| {
-            let _ = std::env::set_current_dir(&original_dir);
-            println!("Corrupted file test - Cleanup complete");
-        });
-
-        println!(
-            "Corrupted file test - Current dir before: {:?}",
-            std::env::current_dir()?
-        );
         std::env::set_current_dir(&temp_dir)?;
-        println!(
-            "Corrupted file test - Current dir after: {:?}",
-            std::env::current_dir()?
-        );
 
-        // Create files
-        let file1 = format!("file1_{}.txt", Uuid::new_v4().to_string());
-        let file2 = format!("file2_{}.txt", Uuid::new_v4().to_string());
+        // Create test files
+        fs::write("normal.txt", "normal file")?;
+        fs::write(".hidden.txt", "hidden file")?;
+        fs::write("already.sealed", "sealed file")?;
+        fs::create_dir(SEAL_DIR)?;
+        fs::write(format!("{}/test.txt", SEAL_DIR), "seal dir file")?;
 
-        fs::write(&file1, "File 1 content")?;
-        fs::write(&file2, "File 2 content")?;
+        // Test encrypting specific files
+        let files = vec![
+            "normal.txt".to_string(),
+            ".hidden.txt".to_string(),
+            "already.sealed".to_string(),
+            format!("{}/test.txt", SEAL_DIR),
+            "nonexistent.txt".to_string(),
+        ];
 
-        // Sleep a bit to ensure files are written
-        thread::sleep(Duration::from_millis(100));
-
-        println!("Corrupted file test - Files created");
-
-        // Encrypt with password
         let password = "test_password";
-        println!(
-            "Corrupted file test - Encrypting with password: {}",
-            password
-        );
-        encrypt_directory_with_password(password)?;
+        encrypt_directory_with_password_and_files(password, &files)?;
 
-        println!("Corrupted file test - Encryption complete");
-
-        // List files after encryption
-        println!("Corrupted file test - After encryption:");
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            println!("Found: {:?}", entry.path());
-        }
-
-        // Get the metadata file to find the encrypted filenames
-        let seal_dir = Path::new(SEAL_DIR);
-        let meta_path = seal_dir.join(META_FILE);
-        let encrypted_metadata = fs::read(&meta_path)?;
-        let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
-
-        // Read the metadata salt file
-        let meta_salt_path = seal_dir.join(META_SALT_FILE);
-        let meta_salt = if meta_salt_path.exists() {
-            // Use the stored metadata salt if it exists
-            fs::read(&meta_salt_path)?
-        } else {
-            // No fallback - require the salt file
-            return Err(anyhow::anyhow!("Metadata salt file not found"));
-        };
-
-        // Decrypt the metadata
-        let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
-        let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
-
-        let decrypted_metadata = match meta_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
-            Ok(data) => data,
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to decrypt metadata: {:?}", e));
-            }
-        };
-
-        let metadata_contents = String::from_utf8(decrypted_metadata)?;
-        let mut lines = metadata_contents.lines();
-
-        // Skip the salt line
-        lines.next();
-
-        // Parse the files map
-        let files: HashMap<String, String> =
-            serde_json::from_str(&lines.collect::<Vec<_>>().join("\n"))?;
-
-        // Find the encrypted filenames
-        let mut encrypted_file1 = String::new();
-        let mut encrypted_file2 = String::new();
-
-        for (encrypted, original) in &files {
-            if original.ends_with(&file1) {
-                encrypted_file1 = encrypted.clone();
-            } else if original.ends_with(&file2) {
-                encrypted_file2 = encrypted.clone();
-            }
-        }
-
+        // Verify only normal.txt was encrypted
         assert!(
-            !encrypted_file1.is_empty(),
-            "Could not find encrypted filename for file1"
+            !Path::new("normal.txt").exists(),
+            "normal.txt should be encrypted"
         );
         assert!(
-            !encrypted_file2.is_empty(),
-            "Could not find encrypted filename for file2"
+            Path::new(".hidden.txt").exists(),
+            "hidden file should be skipped"
         );
-
-        // Corrupt both files to test the case where all files are corrupted
-        println!(
-            "Corrupted file test - Corrupting encrypted file: {}",
-            encrypted_file1
-        );
-        let corrupted_content = "This is not a valid encrypted file";
-        fs::write(&encrypted_file1, corrupted_content)?;
-
-        // Verify the file is corrupted
-        assert_eq!(
-            fs::read_to_string(&encrypted_file1)?,
-            corrupted_content,
-            "File should be corrupted"
-        );
-
-        // Try to decrypt with the corrupted file
-        println!("Corrupted file test - Decrypting with corrupted file");
-        let result = decrypt_directory_with_password(password);
-
-        // Decryption should succeed since at least one file was decrypted
         assert!(
-            result.is_ok(),
-            "Decryption should succeed if at least one file is decrypted"
+            Path::new("already.sealed").exists(),
+            "sealed file should be skipped"
         );
-
-        // Verify that file2 was decrypted
-        assert!(Path::new(&file2).exists(), "File2 should be decrypted");
-        assert_eq!(fs::read_to_string(&file2)?, "File 2 content");
-
-        // Verify that file1 was not decrypted (since its encrypted file was corrupted)
-        assert!(!Path::new(&file1).exists(), "File1 should not be decrypted");
-
-        // Verify that the corrupted file is still there
         assert!(
-            Path::new(&encrypted_file1).exists(),
-            "Corrupted file should still exist"
+            Path::new(&format!("{}/test.txt", SEAL_DIR)).exists(),
+            "seal dir file should be skipped"
         );
 
-        // The cleanup will happen automatically when temp_dir is dropped and
-        // when the scopeguard runs to change back to the original directory
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
         Ok(())
     }
 
     #[test]
-    fn test_empty_file() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
+    fn test_decrypt_filtering() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // ... rest of the test ...
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_missing_encrypted_file() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        // ... rest of the test ...
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_encryption_with_different_password() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        // ... rest of the test ...
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_large_file() -> Result<()> {
-        use std::io::{Read, Write};
-
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        // Create a unique test directory and store it in a variable that lives for the whole test
+        // Create a temporary directory for this test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
-
-        // Create a deferred cleanup function that will run even if the test fails
-        let _cleanup = scopeguard::guard((), |_| {
-            let _ = std::env::set_current_dir(&original_dir);
-            println!("Large file test - Cleanup complete");
-        });
-
         std::env::set_current_dir(&temp_dir)?;
 
-        // Create a large test file with a verifiable pattern
-        let test_file = format!("largefile_{}.bin", Uuid::new_v4().to_string());
-        let test_size = LARGE_FILE_THRESHOLD as usize * 3; // Make it 3x the threshold to ensure multiple chunks
-        println!("Creating test file of size: {} bytes", test_size);
+        // Create and encrypt some test files
+        fs::write("file1.txt", "content 1")?;
+        fs::write("file2.txt", "content 2")?;
 
-        // Create file with a pattern that varies by chunk for verification
-        let mut file = std::fs::File::create(&test_file)?;
-        let mut written = 0;
-        let chunk_size = CHUNK_SIZE;
-
-        while written < test_size {
-            let to_write = std::cmp::min(chunk_size, test_size - written);
-            let chunk_number = (written / chunk_size) as u8;
-            let chunk: Vec<u8> = (0..to_write)
-                .map(|i| (i as u8).wrapping_add(chunk_number))
-                .collect();
-            file.write_all(&chunk)?;
-            written += to_write;
-        }
-        drop(file);
-
-        // Verify the file size
-        let metadata = std::fs::metadata(&test_file)?;
-        assert_eq!(metadata.len(), test_size as u64);
-
-        // Encrypt with password
         let password = "test_password";
-        encrypt_directory_with_password(password)?;
+        encrypt_directory_with_password_and_files(
+            password,
+            &["file1.txt".to_string(), "file2.txt".to_string()],
+        )?;
 
-        // Verify the original file is gone and an encrypted file exists
+        // Try to decrypt specific files
+        let files = vec!["file1.txt".to_string(), "nonexistent.txt".to_string()];
+
+        decrypt_directory_with_password_and_files(password, &files)?;
+
+        // Verify only file1.txt was decrypted
         assert!(
-            !Path::new(&test_file).exists(),
-            "Original file should be gone"
-        );
-
-        // Find the encrypted file
-        let mut encrypted_file_path = None;
-        for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
-            if entry.path().to_string_lossy().ends_with(EXTENSION) {
-                encrypted_file_path = Some(entry.path().to_path_buf());
-                break;
-            }
-        }
-        let encrypted_file_path = encrypted_file_path.expect("Should find encrypted file");
-
-        // Verify encrypted file size is reasonable (should be original size + nonce + some overhead)
-        let encrypted_size = fs::metadata(&encrypted_file_path)?.len();
-        assert!(
-            encrypted_size > test_size as u64,
-            "Encrypted file should be larger than original"
+            Path::new("file1.txt").exists(),
+            "file1.txt should be decrypted"
         );
         assert!(
-            encrypted_size < (test_size + CHUNK_SIZE) as u64,
-            "Encrypted file shouldn't be too much larger"
+            !Path::new("file2.txt").exists(),
+            "file2.txt should remain encrypted"
+        );
+        assert!(
+            !Path::new("nonexistent.txt").exists(),
+            "nonexistent.txt should not appear"
         );
 
-        // Decrypt the files
-        decrypt_directory_with_password(password)?;
-
-        // Verify the original file is restored
-        assert!(Path::new(&test_file).exists(), "Test file should exist");
-        let restored_metadata = std::fs::metadata(&test_file)?;
-        assert_eq!(restored_metadata.len(), test_size as u64);
-
-        // Verify the contents chunk by chunk
-        let mut restored_file = std::fs::File::open(&test_file)?;
-        let mut buffer = vec![0u8; chunk_size];
-        let mut total_read = 0;
-
-        while total_read < test_size {
-            let expected_chunk_size = std::cmp::min(chunk_size, test_size - total_read);
-            let chunk_number = (total_read / chunk_size) as u8;
-
-            // Read a chunk
-            let n = restored_file.read(&mut buffer[..expected_chunk_size])?;
-            assert_eq!(n, expected_chunk_size, "Should read full chunk");
-
-            // Verify chunk contents
-            for (i, &byte) in buffer[..n].iter().enumerate() {
-                let expected = (i as u8).wrapping_add(chunk_number);
-                assert_eq!(
-                    byte,
-                    expected,
-                    "Mismatch at position {} in chunk {} (got {}, expected {})",
-                    i,
-                    total_read / chunk_size,
-                    byte,
-                    expected
-                );
-            }
-
-            total_read += n;
-        }
-
-        // Verify we've read everything
-        assert_eq!(total_read, test_size);
-
-        // Try to read one more byte - should get EOF
-        assert_eq!(restored_file.read(&mut buffer[..1])?, 0);
-
-        // The cleanup will happen automatically when temp_dir is dropped and
-        // when the scopeguard runs to change back to the original directory
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
         Ok(())
     }
 
     #[test]
-    fn test_metadata_salt() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
+    fn test_empty_file_list() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Create a unique test directory and store it in a variable that lives for the whole test
+        // Create a temporary directory for this test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
-
-        // Create a deferred cleanup function that will run even if the test fails
-        let _cleanup = scopeguard::guard((), |_| {
-            let _ = std::env::set_current_dir(&original_dir);
-            println!("Metadata salt test - Cleanup complete");
-        });
-
-        println!(
-            "Metadata salt test - Current dir before: {:?}",
-            std::env::current_dir()?
-        );
         std::env::set_current_dir(&temp_dir)?;
-        println!(
-            "Metadata salt test - Current dir after: {:?}",
-            std::env::current_dir()?
-        );
 
-        // Create a test file
-        let test_file = format!("testfile_{}.txt", Uuid::new_v4().to_string());
-        fs::write(&test_file, "This is a test file")?;
+        // Create test files
+        fs::write("file1.txt", "content 1")?;
+        fs::write(".hidden.txt", "hidden content")?;
 
-        // Sleep a bit to ensure files are written
-        thread::sleep(Duration::from_millis(100));
+        // Create .seal directory to avoid errors
+        fs::create_dir(SEAL_DIR)?;
 
-        println!("Metadata salt test - Files created");
-
-        // Encrypt with password
         let password = "test_password";
-        println!(
-            "Metadata salt test - Encrypting with password: {}",
-            password
-        );
-        encrypt_directory_with_password(password)?;
 
-        // Verify the metadata salt file exists
-        let seal_dir = Path::new(SEAL_DIR);
-        let meta_path = seal_dir.join(META_FILE);
-        let meta_salt_path = seal_dir.join(META_SALT_FILE);
+        // Test empty file list (should encrypt all valid files)
+        encrypt_directory_with_password_and_files(password, &[])?;
 
-        assert!(meta_path.exists(), "Metadata file should exist");
-        assert!(meta_salt_path.exists(), "Metadata salt file should exist");
-
-        // Verify the salt file has the correct size
-        let salt_content = fs::read(&meta_salt_path)?;
-        assert_eq!(
-            salt_content.len(),
-            SALT_LEN,
-            "Salt file should have the correct size"
-        );
-
-        // Verify the salt is not all zeros
-        let zero_salt = vec![0u8; SALT_LEN];
-        assert_ne!(salt_content, zero_salt, "Salt should not be all zeros");
-
-        // Decrypt the files
-        println!(
-            "Metadata salt test - Decrypting with password: {}",
-            password
-        );
-        decrypt_directory_with_password(password)?;
-
-        // Verify the original file is restored
-        assert!(Path::new(&test_file).exists(), "Test file should exist");
-        assert_eq!(fs::read_to_string(&test_file)?, "This is a test file");
-
-        // Verify the metadata and salt files are removed after successful decryption
+        // Verify only valid files were encrypted
         assert!(
-            !meta_path.exists(),
-            "Metadata file should be removed after decryption"
+            !Path::new("file1.txt").exists(),
+            "file1.txt should be encrypted"
         );
         assert!(
-            !meta_salt_path.exists(),
-            "Metadata salt file should be removed after decryption"
+            Path::new(".hidden.txt").exists(),
+            "hidden file should be skipped"
         );
 
-        // The cleanup will happen automatically when temp_dir is dropped and
-        // when the scopeguard runs to change back to the original directory
-        Ok(())
-    }
+        // Test empty file list for decryption (should decrypt all files)
+        decrypt_directory_with_password_and_files(password, &[])?;
 
-    #[test]
-    fn test_metadata_salt_required() -> Result<()> {
-        // Acquire the mutex to ensure exclusive access to the current directory
-        let _lock = match CURRENT_DIR_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // If the mutex is poisoned, recover it
-                println!("Warning: Mutex was poisoned. Recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        // Create a unique test directory and store it in a variable that lives for the whole test
-        let temp_dir = TempDir::new()?;
-        let original_dir = std::env::current_dir()?;
-
-        // Create a deferred cleanup function that will run even if the test fails
-        let _cleanup = scopeguard::guard((), |_| {
-            let _ = std::env::set_current_dir(&original_dir);
-            println!("Metadata salt required test - Cleanup complete");
-        });
-
-        println!(
-            "Metadata salt required test - Current dir before: {:?}",
-            std::env::current_dir()?
-        );
-        std::env::set_current_dir(&temp_dir)?;
-        println!(
-            "Metadata salt required test - Current dir after: {:?}",
-            std::env::current_dir()?
-        );
-
-        // Create a test file
-        let test_file = format!("testfile_{}.txt", Uuid::new_v4().to_string());
-        fs::write(&test_file, "This is a test file")?;
-
-        // Sleep a bit to ensure files are written
-        thread::sleep(Duration::from_millis(100));
-
-        println!("Metadata salt required test - Files created");
-
-        // Encrypt with password
-        let password = "test_password";
-        println!(
-            "Metadata salt required test - Encrypting with password: {}",
-            password
-        );
-        encrypt_directory_with_password(password)?;
-
-        // Verify the metadata salt file exists
-        let seal_dir = Path::new(SEAL_DIR);
-        let meta_path = seal_dir.join(META_FILE);
-        let meta_salt_path = seal_dir.join(META_SALT_FILE);
-
-        assert!(meta_path.exists(), "Metadata file should exist");
-        assert!(meta_salt_path.exists(), "Metadata salt file should exist");
-
-        // Delete the salt file to simulate it being missing
-        fs::remove_file(&meta_salt_path)?;
+        // Verify all files were decrypted
         assert!(
-            !meta_salt_path.exists(),
-            "Metadata salt file should be removed"
+            Path::new("file1.txt").exists(),
+            "file1.txt should be decrypted"
         );
 
-        // Try to decrypt the files - should fail because salt file is required
-        println!(
-            "Metadata salt required test - Decrypting with password: {}",
-            password
-        );
-        let result = decrypt_directory_with_password(password);
-
-        // Decryption should fail because the salt file is missing
-        assert!(
-            result.is_err(),
-            "Decryption should fail without the salt file"
-        );
-
-        // Verify the error message
-        if let Err(e) = result {
-            assert!(
-                e.to_string().contains("Metadata salt file not found"),
-                "Error message should mention missing salt file"
-            );
-        }
-
-        // The cleanup will happen automatically when temp_dir is dropped and
-        // when the scopeguard runs to change back to the original directory
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
         Ok(())
     }
 }

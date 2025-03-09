@@ -1216,9 +1216,15 @@ mod tests {
             }
         };
 
-        // Create a unique test directory
+        // Create a unique test directory and store it in a variable that lives for the whole test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
+
+        // Create a deferred cleanup function that will run even if the test fails
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::env::set_current_dir(&original_dir);
+            println!("Corrupted file test - Cleanup complete");
+        });
 
         println!(
             "Corrupted file test - Current dir before: {:?}",
@@ -1354,10 +1360,8 @@ mod tests {
             "Corrupted file should still exist"
         );
 
-        // Clean up
-        println!("Corrupted file test - Cleaning up");
-        std::env::set_current_dir(original_dir)?;
-
+        // The cleanup will happen automatically when temp_dir is dropped and
+        // when the scopeguard runs to change back to the original directory
         Ok(())
     }
 
@@ -1425,9 +1429,16 @@ mod tests {
             }
         };
 
-        // Create a unique test directory
+        // Create a unique test directory and store it in a variable that lives for the whole test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
+
+        // Create a deferred cleanup function that will run even if the test fails
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::env::set_current_dir(&original_dir);
+            println!("Large file test - Cleanup complete");
+        });
+
         std::env::set_current_dir(&temp_dir)?;
 
         // Create a large test file with a verifiable pattern
@@ -1530,9 +1541,8 @@ mod tests {
         // Try to read one more byte - should get EOF
         assert_eq!(restored_file.read(&mut buffer[..1])?, 0);
 
-        // Clean up
-        std::env::set_current_dir(original_dir)?;
-
+        // The cleanup will happen automatically when temp_dir is dropped and
+        // when the scopeguard runs to change back to the original directory
         Ok(())
     }
 
@@ -1548,9 +1558,15 @@ mod tests {
             }
         };
 
-        // Create a unique test directory
+        // Create a unique test directory and store it in a variable that lives for the whole test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
+
+        // Create a deferred cleanup function that will run even if the test fails
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::env::set_current_dir(&original_dir);
+            println!("Metadata salt test - Cleanup complete");
+        });
 
         println!(
             "Metadata salt test - Current dir before: {:?}",
@@ -1620,10 +1636,8 @@ mod tests {
             "Metadata salt file should be removed after decryption"
         );
 
-        // Clean up
-        println!("Metadata salt test - Cleaning up");
-        std::env::set_current_dir(original_dir)?;
-
+        // The cleanup will happen automatically when temp_dir is dropped and
+        // when the scopeguard runs to change back to the original directory
         Ok(())
     }
 
@@ -1639,9 +1653,15 @@ mod tests {
             }
         };
 
-        // Create a unique test directory
+        // Create a unique test directory and store it in a variable that lives for the whole test
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
+
+        // Create a deferred cleanup function that will run even if the test fails
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::env::set_current_dir(&original_dir);
+            println!("Metadata salt required test - Cleanup complete");
+        });
 
         println!(
             "Metadata salt required test - Current dir before: {:?}",
@@ -1706,10 +1726,8 @@ mod tests {
             );
         }
 
-        // Clean up
-        println!("Metadata salt required test - Cleaning up");
-        std::env::set_current_dir(original_dir)?;
-
+        // The cleanup will happen automatically when temp_dir is dropped and
+        // when the scopeguard runs to change back to the original directory
         Ok(())
     }
 }

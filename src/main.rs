@@ -201,7 +201,17 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
         num_chunks, CHUNK_SIZE
     );
 
+    // Create a progress bar for this file
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("█▓▒░"),
+    );
+
     let mut chunk_index = 0;
+    let mut total_read = 0;
     while let Ok(n) = file.read(&mut buffer) {
         if n == 0 {
             break; // End of file
@@ -226,11 +236,18 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
         temp_file.write_all(&encrypted_chunk)?;
         total_written += 4 + encrypted_chunk.len(); // 4 bytes for size + chunk
 
+        // Update progress
+        total_read += n;
+        pb.set_position(total_read as u64);
+
         #[cfg(test)]
         println!("Processed chunk {}: {} bytes", chunk_index, n);
 
         chunk_index += 1;
     }
+
+    // Finish the progress bar
+    pb.finish_and_clear();
 
     // Verify we wrote the expected number of chunks
     if chunk_index != num_chunks as usize {
@@ -325,7 +342,18 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     #[cfg(test)]
     println!("Decrypting {} chunks", num_chunks);
 
-    let mut total_written = 0;
+    let mut total_written = 0u64;
+    let mut total_read = 8u64; // Start after num_chunks
+
+    // Create a progress bar for this file
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("█▓▒░"),
+    );
+    pb.set_position(total_read);
 
     // Process each chunk
     for chunk_index in 0..num_chunks {
@@ -340,6 +368,8 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
                 e
             ));
         }
+        total_read += NONCE_LEN as u64;
+        pb.set_position(total_read);
 
         // Read the chunk size
         let mut chunk_size_bytes = [0u8; 4];
@@ -352,6 +382,9 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
                 e
             ));
         }
+        total_read += 4u64;
+        pb.set_position(total_read);
+
         let chunk_size = u32::from_le_bytes(chunk_size_bytes) as usize;
 
         // Validate chunk size
@@ -377,6 +410,8 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
                 e
             ));
         }
+        total_read += chunk_size as u64;
+        pb.set_position(total_read);
 
         // Decrypt the chunk
         let decrypted_chunk =
@@ -403,7 +438,7 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
                 e
             ));
         }
-        total_written += decrypted_chunk.len();
+        total_written += decrypted_chunk.len() as u64;
 
         #[cfg(test)]
         println!(
@@ -412,6 +447,9 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
             decrypted_chunk.len()
         );
     }
+
+    // Finish the progress bar
+    pb.finish_and_clear();
 
     // Close the files
     drop(file);
@@ -430,6 +468,7 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
 }
 
 /// Normalize a path string to use forward slashes and remove leading ./
+#[allow(dead_code)]
 fn normalize_path(path: &str) -> String {
     let path = path.replace("\\", "/");
     if path.starts_with("./") {
@@ -897,7 +936,6 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
 }
 
 fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm) -> Result<()> {
-    let mut success = true;
     let mut any_success = false;
 
     // Calculate total size of all files to decrypt
@@ -961,7 +999,6 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
             #[cfg(test)]
             println!("Encrypted file does not exist: {}", encrypted_file);
             eprintln!("Error: encrypted file not found");
-            success = false;
             pb.inc(file_size);
             continue;
         }
@@ -979,7 +1016,6 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                     #[cfg(test)]
                     println!("Failed to write decrypted data: {:?}", e);
                     eprintln!("Error writing decrypted file");
-                    success = false;
                 } else {
                     #[cfg(test)]
                     println!("Successfully wrote decrypted data to: {}", original_file);
@@ -996,7 +1032,6 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                 #[cfg(test)]
                 println!("Failed to decrypt file: {:?}", e);
                 eprintln!("Error decrypting file");
-                success = false;
             }
         }
 
@@ -1418,7 +1453,7 @@ mod tests {
 
     #[test]
     fn test_large_file() -> Result<()> {
-        use std::io::{Read, Seek, Write};
+        use std::io::{Read, Write};
 
         // Acquire the mutex to ensure exclusive access to the current directory
         let _lock = match CURRENT_DIR_MUTEX.lock() {

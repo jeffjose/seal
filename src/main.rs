@@ -607,9 +607,16 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
     use std::{thread, time::Duration};
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    // Use a mutex to ensure only one test can change the current directory at a time
+    lazy_static! {
+        static ref CURRENT_DIR_MUTEX: Mutex<()> = Mutex::new(());
+    }
 
     // Helper function to generate a unique directory name for tests
     fn unique_test_dir() -> String {
@@ -618,6 +625,9 @@ mod tests {
 
     #[test]
     fn test_test_mode() -> Result<()> {
+        // Acquire the mutex to ensure exclusive access to the current directory
+        let _lock = CURRENT_DIR_MUTEX.lock().unwrap();
+
         // This test verifies that the TEST_MODE functionality works correctly
         // It should create a test directory, run the program, and clean up after itself
 
@@ -758,6 +768,9 @@ mod tests {
 
     #[test]
     fn test_encryption_with_different_password() -> Result<()> {
+        // Acquire the mutex to ensure exclusive access to the current directory
+        let _lock = CURRENT_DIR_MUTEX.lock().unwrap();
+
         // Create a unique test directory
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
@@ -862,6 +875,9 @@ mod tests {
 
     #[test]
     fn test_subdirectory_encryption_decryption() -> Result<()> {
+        // Acquire the mutex to ensure exclusive access to the current directory
+        let _lock = CURRENT_DIR_MUTEX.lock().unwrap();
+
         // Create a unique test directory
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;

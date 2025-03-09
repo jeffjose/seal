@@ -156,50 +156,63 @@ fn encrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
 }
 
 fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+
     #[cfg(test)]
     println!("Starting streaming encryption for file: {:?}", path);
 
-    // Read the entire file
-    let contents = match fs::read(path) {
-        Ok(c) => {
-            #[cfg(test)]
-            println!("Successfully read file, size: {} bytes", c.len());
-            c
-        }
-        Err(e) => {
-            #[cfg(test)]
-            println!("Error reading file: {:?}", e);
-            return Err(anyhow::anyhow!("Failed to read file: {}", e));
-        }
-    };
+    // Open the input file
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+
+    // Create a temporary file for the encrypted output
+    let temp_path = path.with_extension("temp_encrypted");
+    let mut temp_file = std::fs::File::create(&temp_path)?;
 
     // Generate a random nonce
-    let mut rng = rand::thread_rng();
     let mut nonce = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
-    #[cfg(test)]
-    println!("Generated nonce of size: {} bytes", nonce.len());
+    OsRng.fill_bytes(&mut nonce);
 
-    // Encrypt the data
-    let encrypted = match cipher.encrypt(Nonce::from_slice(&nonce), contents.as_ref()) {
-        Ok(e) => {
-            #[cfg(test)]
-            println!("Successfully encrypted data, size: {} bytes", e.len());
-            e
-        }
-        Err(e) => {
-            #[cfg(test)]
-            println!("Encryption error: {:?}", e);
-            return Err(anyhow::anyhow!("Encryption failed: {:?}", e));
-        }
-    };
+    // Write the nonce first
+    temp_file.write_all(&nonce)?;
 
-    // Combine nonce and encrypted data
-    let mut result = Vec::with_capacity(NONCE_LEN + encrypted.len());
-    result.extend_from_slice(&nonce);
-    result.extend_from_slice(&encrypted);
+    // Process the file in chunks
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut total_written = NONCE_LEN;
+
     #[cfg(test)]
-    println!("Final encrypted output size: {} bytes", result.len());
+    println!("Processing file in chunks of {} bytes", CHUNK_SIZE);
+
+    while let Ok(n) = file.read(&mut buffer) {
+        if n == 0 {
+            break; // End of file
+        }
+
+        // Encrypt the chunk
+        let encrypted_chunk = cipher
+            .encrypt(Nonce::from_slice(&nonce), &buffer[..n])
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
+
+        // Write the encrypted chunk
+        temp_file.write_all(&encrypted_chunk)?;
+        total_written += encrypted_chunk.len();
+
+        #[cfg(test)]
+        println!("Processed chunk: {} bytes", n);
+    }
+
+    // Close the files
+    drop(file);
+    drop(temp_file);
+
+    #[cfg(test)]
+    println!("Total bytes written: {}", total_written);
+
+    // Read the complete encrypted file
+    let result = fs::read(&temp_path)?;
+
+    // Clean up the temporary file
+    fs::remove_file(&temp_path)?;
 
     Ok(result)
 }
@@ -227,60 +240,68 @@ fn decrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
 }
 
 fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+
     #[cfg(test)]
     println!("Starting streaming decryption for file: {:?}", path);
 
-    // Read the entire file
-    let contents = match fs::read(path) {
-        Ok(c) => {
-            #[cfg(test)]
-            println!("Successfully read file, size: {} bytes", c.len());
-            c
-        }
-        Err(e) => {
-            #[cfg(test)]
-            println!("Error reading file: {:?}", e);
-            return Err(anyhow::anyhow!("Failed to read file: {}", e));
-        }
-    };
+    // Open the encrypted file
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
 
-    if contents.len() <= NONCE_LEN {
-        #[cfg(test)]
-        println!(
-            "File too small (size: {}), minimum required: {}",
-            contents.len(),
-            NONCE_LEN
-        );
+    if file_size <= NONCE_LEN as u64 {
         return Err(anyhow::anyhow!(
             "File too small to be a valid encrypted file"
         ));
     }
 
-    // Split into nonce and ciphertext
-    let (nonce, ciphertext) = contents.split_at(NONCE_LEN);
-    #[cfg(test)]
-    println!(
-        "Nonce size: {}, Ciphertext size: {}",
-        nonce.len(),
-        ciphertext.len()
-    );
+    // Read the nonce
+    let mut nonce = [0u8; NONCE_LEN];
+    file.read_exact(&mut nonce)?;
 
-    // Decrypt
-    match cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
-        Ok(decrypted) => {
-            #[cfg(test)]
-            println!(
-                "Successfully decrypted data, size: {} bytes",
-                decrypted.len()
-            );
-            Ok(decrypted)
+    // Create a temporary file for the decrypted output
+    let temp_path = path.with_extension("temp_decrypted");
+    let mut temp_file = std::fs::File::create(&temp_path)?;
+
+    // Process the file in chunks
+    let mut buffer = vec![0u8; CHUNK_SIZE + 16]; // Extra space for GCM tag
+    let mut total_written = 0;
+
+    #[cfg(test)]
+    println!("Processing file in chunks of {} bytes", CHUNK_SIZE);
+
+    while let Ok(n) = file.read(&mut buffer) {
+        if n == 0 {
+            break; // End of file
         }
-        Err(e) => {
-            #[cfg(test)]
-            println!("Decryption error: {:?}", e);
-            Err(anyhow::anyhow!("Decryption failed: {:?}", e))
-        }
+
+        // Decrypt the chunk
+        let decrypted_chunk = cipher
+            .decrypt(Nonce::from_slice(&nonce), &buffer[..n])
+            .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
+
+        // Write the decrypted chunk
+        temp_file.write_all(&decrypted_chunk)?;
+        total_written += decrypted_chunk.len();
+
+        #[cfg(test)]
+        println!("Processed chunk: {} bytes", n);
     }
+
+    // Close the files
+    drop(file);
+    drop(temp_file);
+
+    #[cfg(test)]
+    println!("Total bytes written: {}", total_written);
+
+    // Read the complete decrypted file
+    let result = fs::read(&temp_path)?;
+
+    // Clean up the temporary file
+    fs::remove_file(&temp_path)?;
+
+    Ok(result)
 }
 
 /// Normalize a path string to use forward slashes and remove leading ./
@@ -569,7 +590,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
             .unwrap()
             .progress_chars("█▓▒░"),
     );
@@ -580,14 +601,6 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     // Encrypt each file
     for path in files_to_encrypt {
         let file_size = file_sizes.get(&path).copied().unwrap_or(0);
-        pb.set_message(format!(
-            "Encrypting: {}",
-            Path::new(&path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
-
         let encrypted = encrypt_file(&Path::new(&path), &cipher)?;
 
         // Generate encrypted path that preserves directory structure but hides real names
@@ -760,19 +773,70 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
 
 fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm) -> Result<()> {
     let mut success = true;
-    for (encrypted_file, original_file) in files {
+
+    // Calculate total size of all files to decrypt
+    let mut total_size: u64 = 0;
+    let mut file_sizes: HashMap<String, u64> = HashMap::new();
+    let mut files_exist: Vec<(String, String)> = Vec::new();
+
+    for (encrypted_name, original_name) in files {
+        if Path::new(encrypted_name).exists() {
+            match fs::metadata(encrypted_name) {
+                Ok(metadata) => {
+                    let size = metadata.len();
+                    total_size += size;
+                    file_sizes.insert(encrypted_name.clone(), size);
+                    files_exist.push((encrypted_name.clone(), original_name.clone()));
+                }
+                Err(e) => {
+                    #[cfg(test)]
+                    println!(
+                        "Error getting metadata for file {}: {:?}",
+                        encrypted_name, e
+                    );
+                }
+            }
+        }
+    }
+
+    if files_exist.is_empty() {
+        return Err(anyhow::anyhow!("No files to decrypt"));
+    }
+
+    // Setup progress bar for decryption
+    println!(
+        "Decrypting {} files ({:.2} MB)...",
+        files_exist.len(),
+        total_size as f64 / 1024.0 / 1024.0
+    );
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("█▓▒░"),
+    );
+
+    // Track start time for speed calculation
+    let start_time = std::time::Instant::now();
+
+    // Process all files
+    for (encrypted_file, original_file) in files_exist {
+        let file_size = file_sizes.get(&encrypted_file).copied().unwrap_or(0);
+
         #[cfg(test)]
         println!(
             "Attempting to decrypt file: {} -> {}",
             encrypted_file, original_file
         );
 
-        let encrypted_path = Path::new(encrypted_file);
+        let encrypted_path = Path::new(&encrypted_file);
         if !encrypted_path.exists() {
             #[cfg(test)]
             println!("Encrypted file does not exist: {}", encrypted_file);
-            eprintln!("Error: encrypted file '{}' not found", encrypted_file);
+            eprintln!("Error: encrypted file not found");
             success = false;
+            pb.inc(file_size);
             continue;
         }
 
@@ -785,24 +849,44 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                 );
 
                 // Write the decrypted data to the original file
-                if let Err(e) = fs::write(original_file, decrypted_data) {
+                if let Err(e) = fs::write(&original_file, decrypted_data) {
                     #[cfg(test)]
                     println!("Failed to write decrypted data: {:?}", e);
-                    eprintln!("Error writing decrypted file '{}': {}", original_file, e);
+                    eprintln!("Error writing decrypted file");
                     success = false;
                 } else {
                     #[cfg(test)]
                     println!("Successfully wrote decrypted data to: {}", original_file);
+
+                    // Remove the encrypted file only after successful decryption and writing
+                    if let Err(e) = fs::remove_file(&encrypted_file) {
+                        #[cfg(test)]
+                        println!("Error removing encrypted file: {:?}", e);
+                    }
                 }
             }
             Err(e) => {
                 #[cfg(test)]
                 println!("Failed to decrypt file: {:?}", e);
-                eprintln!("Error decrypting file '{}': {}", encrypted_file, e);
+                eprintln!("Error decrypting file");
                 success = false;
             }
         }
+
+        pb.inc(file_size);
     }
+
+    // Calculate decryption speed
+    let elapsed = start_time.elapsed();
+    let speed = if elapsed.as_secs() > 0 {
+        total_size as f64 / elapsed.as_secs() as f64 / 1024.0 / 1024.0
+    } else {
+        total_size as f64 / 1024.0 / 1024.0 // If less than a second, just report the total size
+    };
+
+    // Finish progress bar
+    pb.finish_with_message(format!("Done at {:.2} MB/s", speed));
+
     if success {
         Ok(())
     } else {

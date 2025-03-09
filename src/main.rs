@@ -20,6 +20,7 @@ const NONCE_LEN: usize = 12;
 const EXTENSION: &str = "sealed";
 const SEAL_DIR: &str = ".seal";
 const META_FILE: &str = "meta";
+const META_SALT_FILE: &str = "meta.salt";
 const FILENAME_LENGTH: usize = 16; // Length of random filenames
 const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz"; // Only lowercase letters and numbers
 
@@ -290,12 +291,21 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
         let encrypted_metadata = fs::read(&meta_path)?;
         let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
 
-        // Try to decrypt with the zero salt first (for simplicity)
-        let zero_salt = vec![0u8; SALT_LEN];
-        let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
-        let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
+        // Read the metadata salt file
+        let meta_salt_path = seal_dir.join(META_SALT_FILE);
+        let meta_salt = if meta_salt_path.exists() {
+            // Use the stored metadata salt if it exists
+            fs::read(&meta_salt_path)?
+        } else {
+            // No fallback - require the salt file
+            return Err(anyhow::anyhow!("Metadata salt file not found"));
+        };
 
-        let decrypted_metadata = match zero_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+        // Derive key from password and metadata salt
+        let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+        let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
+
+        let decrypted_metadata = match meta_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
             Err(_) => {
                 // If that fails, we can't decrypt the metadata
@@ -376,15 +386,22 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
                 #[cfg(test)]
                 println!("Writing empty metadata: {}", metadata_string);
 
-                // Encrypt the metadata with zero salt for consistency
-                let zero_salt = vec![0u8; SALT_LEN];
-                let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
-                let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
+                // Generate a random salt for metadata encryption
+                let mut meta_salt = vec![0u8; SALT_LEN];
+                OsRng.fill_bytes(&mut meta_salt);
+
+                // Save the metadata salt to a file
+                let meta_salt_path = seal_dir.join(META_SALT_FILE);
+                fs::write(&meta_salt_path, &meta_salt)?;
+
+                // Encrypt the metadata with the random salt
+                let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+                let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
 
                 let mut nonce = vec![0u8; NONCE_LEN];
                 OsRng.fill_bytes(&mut nonce);
 
-                let encrypted_metadata = zero_cipher
+                let encrypted_metadata = meta_cipher
                     .encrypt(Nonce::from_slice(&nonce), metadata_string.as_bytes())
                     .map_err(|e| anyhow::anyhow!("Failed to encrypt metadata: {}", e))?;
 
@@ -458,15 +475,22 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     #[cfg(test)]
     println!("Metadata string: {}", metadata_string);
 
-    // Encrypt the metadata with zero salt for consistency
-    let zero_salt = vec![0u8; SALT_LEN];
-    let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
-    let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
+    // Generate a random salt for metadata encryption
+    let mut meta_salt = vec![0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut meta_salt);
+
+    // Save the metadata salt to a file
+    let meta_salt_path = seal_dir.join(META_SALT_FILE);
+    fs::write(&meta_salt_path, &meta_salt)?;
+
+    // Encrypt the metadata with the random salt
+    let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+    let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
 
     let mut nonce = vec![0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
 
-    let encrypted_metadata = zero_cipher
+    let encrypted_metadata = meta_cipher
         .encrypt(Nonce::from_slice(&nonce), metadata_string.as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to encrypt metadata: {}", e))?;
 
@@ -496,17 +520,26 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
         let encrypted_metadata = fs::read(&meta_path)?;
         let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
 
+        // Read the metadata salt file
+        let meta_salt_path = seal_dir.join(META_SALT_FILE);
+        let meta_salt = if meta_salt_path.exists() {
+            // Use the stored metadata salt if it exists
+            fs::read(&meta_salt_path)?
+        } else {
+            // No fallback - require the salt file
+            return Err(anyhow::anyhow!("Metadata salt file not found"));
+        };
+
         // For debugging in tests
         #[cfg(test)]
-        println!("Decrypting metadata with zero salt");
+        println!("Decrypting metadata with salt: {:?}", meta_salt);
 
-        // Derive key from password and zero salt (same as in encryption)
-        let zero_salt = vec![0u8; SALT_LEN]; // Default salt
-        let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
-        let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
+        // Derive key from password and metadata salt
+        let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+        let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
 
         // Try to decrypt the metadata
-        let decrypted_metadata = match zero_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+        let decrypted_metadata = match meta_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
             Err(e) => {
                 // For debugging in tests
@@ -548,9 +581,12 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
         // Decrypt all files
         let result = decrypt_files_with_cipher(&files, &cipher);
 
-        // If decryption was successful, remove the metadata file
+        // If decryption was successful, remove the metadata file and salt file
         if result.is_ok() {
             fs::remove_file(&meta_path)?;
+            if meta_salt_path.exists() {
+                fs::remove_file(&meta_salt_path)?;
+            }
         }
 
         return result;
@@ -992,12 +1028,21 @@ mod tests {
         let encrypted_metadata = fs::read(&meta_path)?;
         let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
 
-        // Decrypt the metadata
-        let zero_salt = vec![0u8; SALT_LEN];
-        let zero_key = derive_key(password.as_bytes(), &zero_salt)?;
-        let zero_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&zero_key));
+        // Read the metadata salt file
+        let meta_salt_path = seal_dir.join(META_SALT_FILE);
+        let meta_salt = if meta_salt_path.exists() {
+            // Use the stored metadata salt if it exists
+            fs::read(&meta_salt_path)?
+        } else {
+            // No fallback - require the salt file
+            return Err(anyhow::anyhow!("Metadata salt file not found"));
+        };
 
-        let decrypted_metadata = match zero_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
+        // Decrypt the metadata
+        let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+        let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
+
+        let decrypted_metadata = match meta_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
             Err(e) => {
                 return Err(anyhow::anyhow!("Failed to decrypt metadata: {:?}", e));
@@ -1147,6 +1192,183 @@ mod tests {
         };
 
         // ... rest of the test ...
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_salt() -> Result<()> {
+        // Acquire the mutex to ensure exclusive access to the current directory
+        let _lock = match CURRENT_DIR_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // If the mutex is poisoned, recover it
+                println!("Warning: Mutex was poisoned. Recovering...");
+                poisoned.into_inner()
+            }
+        };
+
+        // Create a unique test directory
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+
+        println!(
+            "Metadata salt test - Current dir before: {:?}",
+            std::env::current_dir()?
+        );
+        std::env::set_current_dir(&temp_dir)?;
+        println!(
+            "Metadata salt test - Current dir after: {:?}",
+            std::env::current_dir()?
+        );
+
+        // Create a test file
+        let test_file = format!("testfile_{}.txt", Uuid::new_v4().to_string());
+        fs::write(&test_file, "This is a test file")?;
+
+        // Sleep a bit to ensure files are written
+        thread::sleep(Duration::from_millis(100));
+
+        println!("Metadata salt test - Files created");
+
+        // Encrypt with password
+        let password = "test_password";
+        println!(
+            "Metadata salt test - Encrypting with password: {}",
+            password
+        );
+        encrypt_directory_with_password(password)?;
+
+        // Verify the metadata salt file exists
+        let seal_dir = Path::new(SEAL_DIR);
+        let meta_path = seal_dir.join(META_FILE);
+        let meta_salt_path = seal_dir.join(META_SALT_FILE);
+
+        assert!(meta_path.exists(), "Metadata file should exist");
+        assert!(meta_salt_path.exists(), "Metadata salt file should exist");
+
+        // Verify the salt file has the correct size
+        let salt_content = fs::read(&meta_salt_path)?;
+        assert_eq!(
+            salt_content.len(),
+            SALT_LEN,
+            "Salt file should have the correct size"
+        );
+
+        // Verify the salt is not all zeros
+        let zero_salt = vec![0u8; SALT_LEN];
+        assert_ne!(salt_content, zero_salt, "Salt should not be all zeros");
+
+        // Decrypt the files
+        println!(
+            "Metadata salt test - Decrypting with password: {}",
+            password
+        );
+        decrypt_directory_with_password(password)?;
+
+        // Verify the original file is restored
+        assert!(Path::new(&test_file).exists(), "Test file should exist");
+        assert_eq!(fs::read_to_string(&test_file)?, "This is a test file");
+
+        // Verify the metadata and salt files are removed after successful decryption
+        assert!(
+            !meta_path.exists(),
+            "Metadata file should be removed after decryption"
+        );
+        assert!(
+            !meta_salt_path.exists(),
+            "Metadata salt file should be removed after decryption"
+        );
+
+        // Clean up
+        println!("Metadata salt test - Cleaning up");
+        std::env::set_current_dir(original_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_salt_required() -> Result<()> {
+        // Acquire the mutex to ensure exclusive access to the current directory
+        let _lock = match CURRENT_DIR_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // If the mutex is poisoned, recover it
+                println!("Warning: Mutex was poisoned. Recovering...");
+                poisoned.into_inner()
+            }
+        };
+
+        // Create a unique test directory
+        let temp_dir = TempDir::new()?;
+        let original_dir = std::env::current_dir()?;
+
+        println!(
+            "Metadata salt required test - Current dir before: {:?}",
+            std::env::current_dir()?
+        );
+        std::env::set_current_dir(&temp_dir)?;
+        println!(
+            "Metadata salt required test - Current dir after: {:?}",
+            std::env::current_dir()?
+        );
+
+        // Create a test file
+        let test_file = format!("testfile_{}.txt", Uuid::new_v4().to_string());
+        fs::write(&test_file, "This is a test file")?;
+
+        // Sleep a bit to ensure files are written
+        thread::sleep(Duration::from_millis(100));
+
+        println!("Metadata salt required test - Files created");
+
+        // Encrypt with password
+        let password = "test_password";
+        println!(
+            "Metadata salt required test - Encrypting with password: {}",
+            password
+        );
+        encrypt_directory_with_password(password)?;
+
+        // Verify the metadata salt file exists
+        let seal_dir = Path::new(SEAL_DIR);
+        let meta_path = seal_dir.join(META_FILE);
+        let meta_salt_path = seal_dir.join(META_SALT_FILE);
+
+        assert!(meta_path.exists(), "Metadata file should exist");
+        assert!(meta_salt_path.exists(), "Metadata salt file should exist");
+
+        // Delete the salt file to simulate it being missing
+        fs::remove_file(&meta_salt_path)?;
+        assert!(
+            !meta_salt_path.exists(),
+            "Metadata salt file should be removed"
+        );
+
+        // Try to decrypt the files - should fail because salt file is required
+        println!(
+            "Metadata salt required test - Decrypting with password: {}",
+            password
+        );
+        let result = decrypt_directory_with_password(password);
+
+        // Decryption should fail because the salt file is missing
+        assert!(
+            result.is_err(),
+            "Decryption should fail without the salt file"
+        );
+
+        // Verify the error message
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("Metadata salt file not found"),
+                "Error message should mention missing salt file"
+            );
+        }
+
+        // Clean up
+        println!("Metadata salt required test - Cleaning up");
+        std::env::set_current_dir(original_dir)?;
 
         Ok(())
     }

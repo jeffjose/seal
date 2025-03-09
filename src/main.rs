@@ -193,7 +193,7 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
 
     // Process the file in chunks
     let mut buffer = vec![0u8; CHUNK_SIZE];
-    let mut total_written = 8; // 8 bytes for num_chunks
+    let mut _total_written = 8u64; // 8 bytes for num_chunks
 
     #[cfg(test)]
     println!(
@@ -211,7 +211,7 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     );
 
     let mut chunk_index = 0;
-    let mut total_read = 0;
+    let mut total_read = 0u64;
     while let Ok(n) = file.read(&mut buffer) {
         if n == 0 {
             break; // End of file
@@ -223,7 +223,7 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
 
         // Write the nonce for this chunk
         temp_file.write_all(&nonce)?;
-        total_written += NONCE_LEN;
+        _total_written += NONCE_LEN as u64;
 
         // Encrypt the chunk
         let encrypted_chunk = cipher
@@ -234,11 +234,11 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
         let chunk_size = encrypted_chunk.len() as u32;
         temp_file.write_all(&chunk_size.to_le_bytes())?;
         temp_file.write_all(&encrypted_chunk)?;
-        total_written += 4 + encrypted_chunk.len(); // 4 bytes for size + chunk
+        _total_written += 4u64 + encrypted_chunk.len() as u64; // 4 bytes for size + chunk
 
         // Update progress
-        total_read += n;
-        pb.set_position(total_read as u64);
+        total_read += n as u64;
+        pb.set_position(total_read);
 
         #[cfg(test)]
         println!("Processed chunk {}: {} bytes", chunk_index, n);
@@ -265,7 +265,7 @@ fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     drop(temp_file);
 
     #[cfg(test)]
-    println!("Total bytes written: {}", total_written);
+    println!("Total bytes written: {}", _total_written);
 
     // Read the complete encrypted file
     let result = fs::read(&temp_path)?;
@@ -417,13 +417,13 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
         let decrypted_chunk =
             match cipher.decrypt(Nonce::from_slice(&nonce), encrypted_chunk.as_ref()) {
                 Ok(data) => data,
-                Err(e) => {
+                Err(_e) => {
                     // Clean up temporary file
                     let _ = fs::remove_file(&temp_path);
                     return Err(anyhow::anyhow!(
                         "Failed to decrypt chunk {}: {:?}",
                         chunk_index,
-                        e
+                        _e
                     ));
                 }
             };
@@ -613,8 +613,11 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
 
         let decrypted_metadata = match meta_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
-            Err(_) => {
-                // If that fails, we can't decrypt the metadata
+            Err(_e) => {
+                // For debugging in tests
+                #[cfg(test)]
+                println!("Failed to decrypt metadata: {:?}", _e);
+
                 return Err(anyhow::anyhow!(
                     "Invalid password or corrupted metadata file"
                 ));
@@ -890,10 +893,10 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
         // Try to decrypt the metadata
         let decrypted_metadata = match meta_cipher.decrypt(Nonce::from_slice(nonce), ciphertext) {
             Ok(data) => data,
-            Err(e) => {
+            Err(_e) => {
                 // For debugging in tests
                 #[cfg(test)]
-                println!("Failed to decrypt metadata: {:?}", e);
+                println!("Failed to decrypt metadata: {:?}", _e);
 
                 return Err(anyhow::anyhow!(
                     "Invalid password or corrupted metadata file"
@@ -1021,25 +1024,25 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                 );
 
                 // Write the decrypted data to the original file
-                if let Err(e) = fs::write(&original_file, decrypted_data) {
+                if let Err(_e) = fs::write(&original_file, decrypted_data) {
                     #[cfg(test)]
-                    println!("Failed to write decrypted data: {:?}", e);
+                    println!("Failed to write decrypted data: {:?}", _e);
                     eprintln!("Error writing decrypted file");
                 } else {
                     #[cfg(test)]
                     println!("Successfully wrote decrypted data to: {}", original_file);
 
                     // Remove the encrypted file only after successful decryption and writing
-                    if let Err(e) = fs::remove_file(&encrypted_file) {
+                    if let Err(_e) = fs::remove_file(&encrypted_file) {
                         #[cfg(test)]
-                        println!("Error removing encrypted file: {:?}", e);
+                        println!("Error removing encrypted file: {:?}", _e);
                     }
                     any_success = true;
                 }
             }
-            Err(e) => {
+            Err(_e) => {
                 #[cfg(test)]
-                println!("Failed to decrypt file: {:?}", e);
+                println!("Failed to decrypt file: {:?}", _e);
                 eprintln!("Error decrypting file");
             }
         }

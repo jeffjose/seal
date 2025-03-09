@@ -745,6 +745,10 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
         }
     }
 
+    // Add estimated size for metadata operations (rough estimate)
+    let metadata_ops_size = 1024 * 1024; // 1MB for metadata operations
+    total_size += metadata_ops_size;
+
     // Setup progress bar based on total file size
     println!(
         "Encrypting {} files ({:.2} MB)...",
@@ -754,7 +758,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
             .unwrap()
             .progress_chars("█▓▒░"),
     );
@@ -765,6 +769,7 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     // Encrypt each file
     for path in files_to_encrypt {
         let file_size = file_sizes.get(&path).copied().unwrap_or(0);
+        pb.set_message("Encrypting files...");
         let encrypted = encrypt_file(&Path::new(&path), &cipher)?;
 
         // Generate encrypted path that preserves directory structure but hides real names
@@ -791,6 +796,46 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
         pb.inc(file_size);
     }
 
+    // Update progress for metadata operations
+    pb.set_message("Cleaning up empty directories...");
+    remove_empty_directories(Path::new("."))?;
+    pb.inc(metadata_ops_size / 4);
+
+    pb.set_message("Generating metadata...");
+    // Save metadata as a string first
+    let metadata_string = format!(
+        "{}\n{}",
+        metadata.salt,
+        serde_json::to_string(&metadata.files)?
+    );
+    pb.inc(metadata_ops_size / 4);
+
+    // Generate a random salt for metadata encryption
+    let mut meta_salt = vec![0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut meta_salt);
+
+    pb.set_message("Encrypting metadata...");
+    // Save the metadata salt to a file
+    let meta_salt_path = seal_dir.join(META_SALT_FILE);
+    fs::write(&meta_salt_path, &meta_salt)?;
+
+    // Encrypt the metadata with the random salt
+    let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+    let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
+    pb.inc(metadata_ops_size / 4);
+
+    let mut nonce = vec![0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+
+    let encrypted_metadata = meta_cipher
+        .encrypt(Nonce::from_slice(&nonce), metadata_string.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to encrypt metadata: {}", e))?;
+
+    pb.set_message("Writing metadata...");
+    // Write the encrypted metadata file to the new location
+    fs::write(meta_path, [nonce.as_slice(), &encrypted_metadata].concat())?;
+    pb.inc(metadata_ops_size / 4);
+
     // Calculate encryption speed
     let elapsed = start_time.elapsed();
     let speed = if elapsed.as_secs() > 0 {
@@ -801,42 +846,6 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
 
     // Finish progress bar
     pb.finish_with_message(format!("Done at {:.2} MB/s", speed));
-
-    // Remove empty directories after all files have been encrypted
-    remove_empty_directories(Path::new("."))?;
-
-    // Save metadata as a string first
-    let metadata_string = format!(
-        "{}\n{}",
-        metadata.salt,
-        serde_json::to_string(&metadata.files)?
-    );
-
-    // For debugging in tests
-    #[cfg(test)]
-    println!("Metadata string: {}", metadata_string);
-
-    // Generate a random salt for metadata encryption
-    let mut meta_salt = vec![0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut meta_salt);
-
-    // Save the metadata salt to a file
-    let meta_salt_path = seal_dir.join(META_SALT_FILE);
-    fs::write(&meta_salt_path, &meta_salt)?;
-
-    // Encrypt the metadata with the random salt
-    let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
-    let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
-
-    let mut nonce = vec![0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-
-    let encrypted_metadata = meta_cipher
-        .encrypt(Nonce::from_slice(&nonce), metadata_string.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Failed to encrypt metadata: {}", e))?;
-
-    // Write the encrypted metadata file to the new location
-    fs::write(meta_path, [nonce.as_slice(), &encrypted_metadata].concat())?;
 
     Ok(())
 }

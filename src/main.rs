@@ -11,10 +11,7 @@ use nanoid::nanoid;
 use rand::{rngs::OsRng, RngCore};
 use rpassword::read_password;
 use serde::{Deserialize, Serialize};
-use std::thread;
-use std::time::Duration;
 use std::{collections::HashMap, fs, io::Write, path::Path};
-use uuid::Uuid;
 use walkdir::WalkDir;
 
 const SALT_LEN: usize = 32;
@@ -762,7 +759,6 @@ mod tests {
     #[test]
     fn test_encryption_with_different_password() -> Result<()> {
         // Create a unique test directory
-        let test_dir_name = unique_test_dir();
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
         std::env::set_current_dir(&temp_dir)?;
@@ -867,7 +863,6 @@ mod tests {
     #[test]
     fn test_subdirectory_encryption_decryption() -> Result<()> {
         // Create a unique test directory
-        let test_dir_name = unique_test_dir();
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
 

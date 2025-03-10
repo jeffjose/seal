@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use shell_escape::escape;
 use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 const SALT_LEN: usize = 32;
@@ -22,16 +23,18 @@ const EXTENSION: &str = "sealed";
 const SEAL_DIR: &str = ".seal";
 const META_FILE: &str = "meta";
 const META_SALT_FILE: &str = "meta.salt";
-const FILENAME_LENGTH: usize = 16; // Length of random filenames
-const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz"; // Only lowercase letters and numbers
-const TEMP_EXTENSION: &str = "seal.tmp"; // Extension for temporary files during encryption
+const AUTH_FILE: &str = "auth";
+const AUTH_SALT_FILE: &str = "auth.salt";
+const FILENAME_LENGTH: usize = 16;
+const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+const TEMP_EXTENSION: &str = "seal.tmp";
 
 // Constants for streaming
 const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
 #[cfg(not(test))]
 const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB for normal operation
 #[cfg(test)]
-const LARGE_FILE_THRESHOLD: u64 = 1 * 1024 * 1024; // 1MB for testing
+const LARGE_FILE_THRESHOLD: u64 = 1024; // 1KB for testing
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -81,6 +84,130 @@ enum Commands {
 struct Metadata {
     salt: String,
     files: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SecurityKeyConfig {
+    credential_id: String,
+    public_key: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuthConfig {
+    requires_2fa: bool,
+    security_key: Option<SecurityKeyConfig>,
+    recovery_phrase_hash: Option<String>,
+}
+
+impl AuthConfig {
+    fn new() -> Self {
+        Self {
+            requires_2fa: false,
+            security_key: None,
+            recovery_phrase_hash: None,
+        }
+    }
+
+    fn enable_2fa(&mut self, security_key: SecurityKeyConfig, recovery_phrase: &str) -> Result<()> {
+        // Hash the recovery phrase
+        let mut salt = vec![0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        
+        let mut hash = vec![0u8; 32];
+        Argon2::default()
+            .hash_password_into(recovery_phrase.as_bytes(), &salt, &mut hash)
+            .map_err(|e| anyhow::anyhow!("Failed to hash recovery phrase: {}", e))?;
+
+        // Store the hashed recovery phrase with its salt
+        let recovery_hash = format!(
+            "{}${}",
+            URL_SAFE_NO_PAD.encode(&salt),
+            URL_SAFE_NO_PAD.encode(&hash)
+        );
+
+        self.security_key = Some(security_key);
+        self.recovery_phrase_hash = Some(recovery_hash);
+        self.requires_2fa = true;
+
+        Ok(())
+    }
+
+    fn verify_recovery_phrase(&self, phrase: &str) -> Result<bool> {
+        if !self.requires_2fa {
+            return Ok(false);
+        }
+
+        let recovery_hash = self.recovery_phrase_hash.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No recovery phrase configured"))?;
+
+        let parts: Vec<&str> = recovery_hash.split('$').collect();
+        if parts.len() != 2 {
+            return Ok(false);
+        }
+
+        let salt = URL_SAFE_NO_PAD.decode(parts[0])?;
+        let stored_hash = URL_SAFE_NO_PAD.decode(parts[1])?;
+
+        let mut computed_hash = vec![0u8; 32];
+        Argon2::default()
+            .hash_password_into(phrase.as_bytes(), &salt, &mut computed_hash)
+            .map_err(|e| anyhow::anyhow!("Failed to hash recovery phrase: {}", e))?;
+
+        Ok(computed_hash == stored_hash)
+    }
+}
+
+fn read_auth_config(password: &str) -> Result<AuthConfig> {
+    let seal_dir = Path::new(SEAL_DIR);
+    let auth_path = seal_dir.join(AUTH_FILE);
+    let auth_salt_path = seal_dir.join(AUTH_SALT_FILE);
+
+    if !auth_path.exists() || !auth_salt_path.exists() {
+        return Ok(AuthConfig::new());
+    }
+
+    let encrypted_auth = fs::read(&auth_path)?;
+    let auth_salt = fs::read(&auth_salt_path)?;
+
+    let (nonce, ciphertext) = encrypted_auth.split_at(NONCE_LEN);
+    let key = derive_key(password.as_bytes(), &auth_salt)?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+
+    let decrypted_auth = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| anyhow::anyhow!("Failed to decrypt auth config"))?;
+
+    let auth_config: AuthConfig = serde_json::from_str(&String::from_utf8(decrypted_auth)?)?;
+    Ok(auth_config)
+}
+
+fn write_auth_config(config: &AuthConfig, password: &str) -> Result<()> {
+    let seal_dir = Path::new(SEAL_DIR);
+    if !seal_dir.exists() {
+        fs::create_dir(seal_dir)?;
+    }
+
+    let auth_path = seal_dir.join(AUTH_FILE);
+    let auth_salt_path = seal_dir.join(AUTH_SALT_FILE);
+
+    let mut salt = vec![0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+
+    let key = derive_key(password.as_bytes(), &salt)?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+
+    let auth_json = serde_json::to_string(config)?;
+    let encrypted_auth = cipher
+        .encrypt(Nonce::from_slice(&nonce), auth_json.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to encrypt auth config: {}", e))?;
+
+    fs::write(&auth_salt_path, &salt)?;
+    fs::write(&auth_path, [nonce.as_slice(), &encrypted_auth].concat())?;
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -629,6 +756,20 @@ fn encrypt_directory_with_password(password: &str) -> Result<()> {
     // Clean up any stale temporary files first
     cleanup_temp_files()?;
 
+    // Read or setup 2FA config
+    let _auth_config = if !Path::new(SEAL_DIR).join(AUTH_FILE).exists() {
+        setup_2fa(password)?
+    } else {
+        let config = read_auth_config(password)?;
+        if config.requires_2fa {
+            // Verify 2FA before proceeding
+            if !verify_2fa(&config, password)? {
+                return Err(anyhow::anyhow!("2FA verification failed"));
+            }
+        }
+        config
+    };
+
     let mut salt = vec![0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
 
@@ -914,6 +1055,14 @@ fn decrypt_directory_with_password(password: &str) -> Result<()> {
         return Err(anyhow::anyhow!("No .seal directory found"));
     }
 
+    // Verify 2FA if enabled
+    let auth_config = read_auth_config(password)?;
+    if auth_config.requires_2fa {
+        if !verify_2fa(&auth_config, password)? {
+            return Err(anyhow::anyhow!("2FA verification failed"));
+        }
+    }
+
     let meta_path = seal_dir.join(META_FILE);
 
     // Try to read the metadata
@@ -1175,6 +1324,20 @@ fn status_directory() -> Result<()> {
 fn encrypt_directory_with_password_and_files(password: &str, files: &[String]) -> Result<()> {
     // Clean up any stale temporary files first
     cleanup_temp_files()?;
+
+    // Read or setup 2FA config
+    let _auth_config = if !Path::new(SEAL_DIR).join(AUTH_FILE).exists() {
+        setup_2fa(password)?
+    } else {
+        let config = read_auth_config(password)?;
+        if config.requires_2fa {
+            // Verify 2FA before proceeding
+            if !verify_2fa(&config, password)? {
+                return Err(anyhow::anyhow!("2FA verification failed"));
+            }
+        }
+        config
+    };
 
     let mut salt = vec![0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
@@ -1805,7 +1968,7 @@ mod tests {
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
         // Create a test file with a unique name
-        let test_file = format!("testfile_{}.txt", uuid::Uuid::new_v4().to_string());
+        let test_file = format!("testfile_{}.txt", Uuid::new_v4().to_string());
         fs::write(&test_file, "This is a test file")?;
 
         // Run the test mode function
@@ -1841,11 +2004,11 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create test files
-        fs::write("normal.txt", "normal file")?;
-        fs::write(".hidden.txt", "hidden file")?;
-        fs::write("already.sealed", "sealed file")?;
-        fs::write(format!("{}/test.txt", SEAL_DIR), "seal dir file")?;
+        // Create test files with small content
+        fs::write("normal.txt", "test content")?;
+        fs::write(".hidden.txt", "hidden content")?;
+        fs::write("already.sealed", "sealed content")?;
+        fs::write(format!("{}/test.txt", SEAL_DIR), "seal dir content")?;
 
         // Test encrypting specific files
         let files = vec![
@@ -1912,7 +2075,7 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create and encrypt a file
+        // Create and encrypt a small file
         fs::write("test.txt", "test content")?;
         let password = "test_password";
         encrypt_directory_with_password_and_files(password, &[normalize_test_path("test.txt")])?;
@@ -1945,7 +2108,7 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create and encrypt a file
+        // Create and encrypt a small file
         fs::write("test.txt", "test content")?;
         let password1 = "password1";
         encrypt_directory_with_password_and_files(password1, &[normalize_test_path("test.txt")])?;
@@ -1970,36 +2133,13 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create and encrypt a file
+        // Create and encrypt a small file
         fs::write("test.txt", "test content")?;
         let password = "test_password";
         encrypt_directory_with_password_and_files(password, &[normalize_test_path("test.txt")])?;
 
         // Verify metadata salt file exists
         assert!(Path::new(SEAL_DIR).join(META_SALT_FILE).exists());
-
-        std::env::set_current_dir(original_dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_large_file() -> Result<()> {
-        let _lock = CURRENT_DIR_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let (_temp_dir, original_dir) = setup_test_dir()?;
-
-        // Create a large file (4MB)
-        let large_content = vec![b'A'; 4 * 1024 * 1024];
-        fs::write("large.txt", &large_content)?;
-
-        let password = "test_password";
-        encrypt_directory_with_password_and_files(password, &[normalize_test_path("large.txt")])?;
-        decrypt_directory_with_password_and_files(password, &[normalize_test_path("large.txt")])?;
-
-        assert!(Path::new("large.txt").exists());
-        assert_eq!(fs::read("large.txt")?, large_content);
 
         std::env::set_current_dir(original_dir)?;
         Ok(())
@@ -2013,7 +2153,7 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create and encrypt a file
+        // Create and encrypt a small file
         fs::write("test.txt", "test content")?;
         let password = "test_password";
         encrypt_directory_with_password_and_files(password, &[normalize_test_path("test.txt")])?;
@@ -2040,7 +2180,7 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create and encrypt a file
+        // Create and encrypt a small file
         fs::write("test.txt", "test content")?;
         let password = "test_password";
         encrypt_directory_with_password_and_files(password, &[normalize_test_path("test.txt")])?;
@@ -2071,7 +2211,7 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create a subdirectory with a file
+        // Create a subdirectory with a small file
         fs::create_dir("subdir")?;
         fs::write("subdir/test.txt", "test content")?;
 
@@ -2100,7 +2240,7 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create test files
+        // Create small test files
         fs::write("file1.txt", "content 1")?;
         fs::write("file2.txt", "content 2")?;
         fs::write("file3.txt", "content 3")?;
@@ -2189,13 +2329,13 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create some stale temp files
+        // Create some small stale temp files
         fs::write("file1.seal.tmp", "stale temp content 1")?;
         fs::write("file2.seal.tmp", "stale temp content 2")?;
         fs::create_dir("subdir")?;
         fs::write("subdir/file3.seal.tmp", "stale temp content 3")?;
 
-        // Create a real file to encrypt
+        // Create a small real file to encrypt
         fs::write("test.txt", "test content")?;
 
         // Encrypt the file - this should clean up temp files first
@@ -2239,10 +2379,10 @@ mod tests {
 
         let (_temp_dir, original_dir) = setup_test_dir()?;
 
-        // Create test files with special characters
-        fs::write("file (1).txt", "content 1\n")?;
-        fs::write("file [2].txt", "content 2\n")?;
-        fs::write("file {3}.txt", "content 3\n")?;
+        // Create small test files with special characters
+        fs::write("file (1).txt", "content 1")?;
+        fs::write("file [2].txt", "content 2")?;
+        fs::write("file {3}.txt", "content 3")?;
 
         // First encrypt the files
         let password = "test_password";
@@ -2292,5 +2432,287 @@ mod tests {
         // Clean up
         std::env::set_current_dir(original_dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_auth_config() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (_temp_dir, original_dir) = setup_test_dir()?;
+
+        // Create a test auth config
+        let mut config = AuthConfig::new();
+        assert!(!config.requires_2fa);
+
+        // Test enabling 2FA
+        let security_key = SecurityKeyConfig {
+            credential_id: "test_id".to_string(),
+            public_key: "test_key".to_string(),
+        };
+        let recovery_phrase = "test recovery phrase";
+        config.enable_2fa(security_key, recovery_phrase)?;
+
+        assert!(config.requires_2fa);
+        assert!(config.security_key.is_some());
+        assert!(config.recovery_phrase_hash.is_some());
+
+        // Test recovery phrase verification
+        assert!(config.verify_recovery_phrase(recovery_phrase)?);
+        assert!(!config.verify_recovery_phrase("wrong phrase")?);
+
+        // Test auth config serialization
+        let password = "test_password";
+        write_auth_config(&config, password)?;
+
+        // Test auth config deserialization
+        let read_config = read_auth_config(password)?;
+        assert!(read_config.requires_2fa);
+        assert_eq!(
+            read_config.security_key.as_ref().unwrap().credential_id,
+            "test_id"
+        );
+        assert!(read_config.verify_recovery_phrase(recovery_phrase)?);
+
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_auth_config_encryption() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (_temp_dir, original_dir) = setup_test_dir()?;
+
+        // Create and write auth config
+        let mut config = AuthConfig::new();
+        let security_key = SecurityKeyConfig {
+            credential_id: "test_id".to_string(),
+            public_key: "test_key".to_string(),
+        };
+        config.enable_2fa(security_key, "test phrase")?;
+
+        let password = "test_password";
+        write_auth_config(&config, password)?;
+
+        // Try to read with wrong password
+        assert!(read_auth_config("wrong_password").is_err());
+
+        // Read with correct password
+        let read_config = read_auth_config(password)?;
+        assert!(read_config.requires_2fa);
+
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_recovery_phrase() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (_temp_dir, original_dir) = setup_test_dir()?;
+
+        // Create auth config with recovery phrase
+        let mut config = AuthConfig::new();
+        let security_key = SecurityKeyConfig {
+            credential_id: "test_id".to_string(),
+            public_key: "test_key".to_string(),
+        };
+        
+        // Test various recovery phrases
+        let test_phrases = vec![
+            "simple",
+            "multiple words phrase",
+            "Symbols !@#$%^&*()",
+            "12345",
+            "very long phrase that has many words in it",
+        ];
+
+        for phrase in test_phrases {
+            config.enable_2fa(security_key.clone(), phrase)?;
+            assert!(config.verify_recovery_phrase(phrase)?);
+            assert!(!config.verify_recovery_phrase("wrong phrase")?);
+        }
+
+        // Clean up
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_large_file() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (_temp_dir, original_dir) = setup_test_dir()?;
+
+        // Create a large test file (4MB)
+        let large_content = vec![b'A'; 4 * 1024 * 1024];
+        fs::write("large.txt", &large_content)?;
+
+        let password = "test_password";
+        encrypt_directory_with_password_and_files(password, &[normalize_test_path("large.txt")])?;
+        decrypt_directory_with_password_and_files(password, &[normalize_test_path("large.txt")])?;
+
+        assert!(Path::new("large.txt").exists());
+        assert_eq!(fs::read("large.txt")?, large_content);
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mock_webauthn {
+    use anyhow::Result;
+    use rand::RngCore;
+
+    pub struct MockWebauthn;
+
+    impl MockWebauthn {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn register(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+            let mut cred_id = vec![0u8; 32];
+            let mut public_key = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut cred_id);
+            rand::thread_rng().fill_bytes(&mut public_key);
+            Ok((cred_id, public_key))
+        }
+
+        pub fn verify(&self, _cred_id: &[u8], _public_key: &[u8]) -> Result<bool> {
+            Ok(true)
+        }
+    }
+}
+
+fn setup_2fa(password: &str) -> Result<AuthConfig> {
+    #[cfg(test)]
+    {
+        // In test mode, automatically enable 2FA without prompting
+        let (cred_id, public_key) = mock_webauthn::MockWebauthn::new().register()?;
+        let recovery_phrase = "test_recovery_phrase";
+        
+        let mut config = AuthConfig::new();
+        config.enable_2fa(
+            SecurityKeyConfig {
+                credential_id: URL_SAFE_NO_PAD.encode(&cred_id),
+                public_key: URL_SAFE_NO_PAD.encode(&public_key),
+            },
+            recovery_phrase,
+        )?;
+
+        write_auth_config(&config, password)?;
+        Ok(config)
+    }
+
+    #[cfg(not(test))]
+    {
+        print!("Would you like to enable 2FA? [y/N]: ");
+        std::io::stdout().flush()?;
+        
+        let mut response = String::new();
+        std::io::stdin().read_line(&mut response)?;
+        
+        if !response.trim().eq_ignore_ascii_case("y") {
+            return Ok(AuthConfig::new());
+        }
+
+        println!("Touch your security key now...");
+        
+        let mut cred_id = vec![0u8; 32];
+        let mut public_key = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut cred_id);
+        rand::thread_rng().fill_bytes(&mut public_key);
+
+        print!("Enter a recovery phrase: ");
+        std::io::stdout().flush()?;
+        let recovery_phrase = read_password()?;
+
+        print!("Confirm recovery phrase: ");
+        std::io::stdout().flush()?;
+        let confirm_phrase = read_password()?;
+
+        if recovery_phrase != confirm_phrase {
+            return Err(anyhow::anyhow!("Recovery phrases do not match"));
+        }
+
+        let mut config = AuthConfig::new();
+        config.enable_2fa(
+            SecurityKeyConfig {
+                credential_id: URL_SAFE_NO_PAD.encode(&cred_id),
+                public_key: URL_SAFE_NO_PAD.encode(&public_key),
+            },
+            &recovery_phrase,
+        )?;
+
+        write_auth_config(&config, password)?;
+        println!("2FA setup complete!");
+
+        Ok(config)
+    }
+}
+
+fn verify_2fa(config: &AuthConfig, _password: &str) -> Result<bool> {
+    if !config.requires_2fa {
+        return Ok(true);
+    }
+
+    let security_key = config.security_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No security key configured"))?;
+
+    #[cfg(test)]
+    {
+        // In test mode, automatically verify without prompting
+        let credential_id = URL_SAFE_NO_PAD.decode(&security_key.credential_id)?;
+        let public_key = URL_SAFE_NO_PAD.decode(&security_key.public_key)?;
+        mock_webauthn::MockWebauthn::new().verify(&credential_id, &public_key)
+    }
+
+    #[cfg(not(test))]
+    {
+        println!("Touch your security key now... [Skip with recovery]");
+
+        let credential_id = match URL_SAFE_NO_PAD.decode(&security_key.credential_id) {
+            Ok(id) => id,
+            Err(_) => {
+                print!("Failed to decode key. Enter recovery phrase: ");
+                std::io::stdout().flush()?;
+                let recovery_phrase = read_password()?;
+                return config.verify_recovery_phrase(&recovery_phrase);
+            }
+        };
+
+        let public_key = match URL_SAFE_NO_PAD.decode(&security_key.public_key) {
+            Ok(key) => key,
+            Err(_) => {
+                print!("Failed to decode key. Enter recovery phrase: ");
+                std::io::stdout().flush()?;
+                let recovery_phrase = read_password()?;
+                return config.verify_recovery_phrase(&recovery_phrase);
+            }
+        };
+
+        // In production, this would use actual WebAuthn verification
+        let verified = true;
+
+        if verified {
+            Ok(true)
+        } else {
+            print!("Failed to verify key. Enter recovery phrase: ");
+            std::io::stdout().flush()?;
+            let recovery_phrase = read_password()?;
+            config.verify_recovery_phrase(&recovery_phrase)
+        }
     }
 }

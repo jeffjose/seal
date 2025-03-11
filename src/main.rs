@@ -1094,6 +1094,17 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                         #[cfg(test)]
                         println!("Error removing encrypted file: {:?}", _e);
                     }
+
+                    // Clean up any empty directories after removing the encrypted file
+                    if let Some(parent) = encrypted_path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            #[cfg(test)]
+                            println!("Checking for empty directories after decrypting: {:?}", parent);
+                            
+                            remove_empty_directories(parent)?;
+                        }
+                    }
+
                     any_success = true;
                 }
             }
@@ -1120,6 +1131,8 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
 
     // Consider it a success if at least one file was decrypted successfully
     if any_success {
+        // Do one final cleanup of any remaining empty directories
+        remove_empty_directories(Path::new("."))?;
         Ok(())
     } else {
         Err(anyhow::anyhow!("All files failed to decrypt"))
@@ -1495,11 +1508,20 @@ fn decrypt_directory_with_password_and_files(password: &str, files: &[String]) -
 
         let result = decrypt_files_with_cipher(&files_to_decrypt, &cipher);
 
-        // Only remove metadata if all files were decrypted and no specific files were requested
-        if result.is_ok() && files.is_empty() {
-            fs::remove_file(&meta_path)?;
-            if meta_salt_path.exists() {
-                fs::remove_file(&meta_salt_path)?;
+        // Clean up empty directories after decryption
+        if result.is_ok() {
+            #[cfg(test)]
+            println!("Cleaning up empty directories after decryption");
+            
+            // Remove empty directories that might have been created during encryption
+            remove_empty_directories(Path::new("."))?;
+            
+            // Only remove metadata if all files were decrypted and no specific files were requested
+            if files.is_empty() {
+                fs::remove_file(&meta_path)?;
+                if meta_salt_path.exists() {
+                    fs::remove_file(&meta_salt_path)?;
+                }
             }
         }
 
@@ -2090,6 +2112,79 @@ mod tests {
 
         std::env::set_current_dir(original_dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_encrypted_subdirectory_cleanup() -> Result<()> {
+        let _lock = CURRENT_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (_temp_dir, original_dir) = setup_test_dir()?;
+
+        // Create a nested subdirectory structure with files
+        fs::create_dir_all("nested/subdir")?;
+        fs::write("nested/subdir/test.txt", "test content")?;
+        fs::write("nested/test2.txt", "more content")?;
+
+        let password = "test_password";
+        
+        // Encrypt the files
+        encrypt_directory_with_password_and_files(
+            password,
+            &[
+                normalize_test_path("nested/subdir/test.txt"),
+                normalize_test_path("nested/test2.txt"),
+            ],
+        )?;
+        
+        // Count the number of directories before decryption
+        // Note: count_directories already skips .seal directory
+        let dir_count_before = count_directories(".")?;
+        
+        // Decrypt the files
+        decrypt_directory_with_password_and_files(
+            password,
+            &[
+                normalize_test_path("nested/subdir/test.txt"),
+                normalize_test_path("nested/test2.txt"),
+            ],
+        )?;
+        
+        // Verify original files exist
+        assert!(Path::new("nested/subdir/test.txt").exists());
+        assert!(Path::new("nested/test2.txt").exists());
+        assert_eq!(fs::read_to_string("nested/subdir/test.txt")?, "test content");
+        assert_eq!(fs::read_to_string("nested/test2.txt")?, "more content");
+        
+        // Count directories after decryption
+        let dir_count_after = count_directories(".")?;
+        
+        // Verify no extra directories exist (only the original ones)
+        // count_directories already skips .seal directory, so we don't need to adjust the counts
+        assert_eq!(dir_count_before, dir_count_after, 
+            "Extra directories were not cleaned up after decryption");
+
+        std::env::set_current_dir(original_dir)?;
+        Ok(())
+    }
+    
+    // Helper function to count directories recursively
+    fn count_directories(dir: &str) -> Result<usize> {
+        let mut count = 0;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip .seal directory in the count
+                if path.to_string_lossy().contains(SEAL_DIR) {
+                    continue;
+                }
+                count += 1;
+                count += count_directories(path.to_str().unwrap())?;
+            }
+        }
+        Ok(count)
     }
 
     #[test]

@@ -489,16 +489,6 @@ fn decrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Normalize a path string to use forward slashes and remove leading ./
-fn normalize_path(path: &str) -> String {
-    let path = path.replace("\\", "/");
-    if path.starts_with("./") {
-        path[2..].to_string()
-    } else {
-        path
-    }
-}
-
 /// Generate a user-friendly filename using nanoid with a custom alphabet
 fn generate_friendly_filename() -> String {
     format!(

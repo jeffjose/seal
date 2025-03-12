@@ -884,8 +884,8 @@ fn encrypt_file_at_path(
         .to_string_lossy()
         .to_string();
 
-    // Generate a random filename for the encrypted file
-    let encrypted_filename = format!("{}.{}", uuid::Uuid::new_v4(), EXTENSION);
+    // Generate a friendly filename for the encrypted file
+    let encrypted_filename = generate_friendly_filename();
 
     #[cfg(test)]
     println!("Encrypting file: {} -> {}", file_path.display(), encrypted_filename);
@@ -2381,6 +2381,67 @@ mod tests {
 
         // Run the command
         run_command_on_files_at_path(&command, Some("test_password"), base_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nanoid_custom_alphabet() -> Result<()> {
+        let temp_dir = setup_test_dir()?;
+        let base_dir = temp_dir.path();
+
+        // Create a subdirectory with a file
+        fs::create_dir(base_dir.join("subdir"))?;
+        fs::write(base_dir.join("subdir/test.txt"), "test content")?;
+
+        let password = "test_password";
+        encrypt_directory_with_password_and_files_at_path(
+            password,
+            &[normalize_test_path("subdir/test.txt")],
+            base_dir
+        )?;
+
+        // Get the encrypted filenames from metadata
+        let meta_path = base_dir.join(SEAL_DIR).join(META_FILE);
+        let encrypted_metadata = fs::read(&meta_path)?;
+        let (nonce, ciphertext) = encrypted_metadata.split_at(NONCE_LEN);
+        let meta_salt = fs::read(base_dir.join(SEAL_DIR).join(META_SALT_FILE))?;
+        let meta_key = derive_key(password.as_bytes(), &meta_salt)?;
+        let meta_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&meta_key));
+        let decrypted_metadata = meta_cipher
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt metadata: {:?}", e))?;
+        let metadata_contents = String::from_utf8(decrypted_metadata)?;
+        let mut lines = metadata_contents.lines();
+        let _salt_str = lines.next().unwrap();
+        let all_files: HashMap<String, String> =
+            serde_json::from_str(&lines.collect::<Vec<_>>().join("\n"))?;
+
+        // Get the encrypted path for our file
+        let encrypted_path = all_files
+            .iter()
+            .find(|(_, original)| original.as_str() == "subdir/test.txt")
+            .map(|(encrypted, _)| encrypted.clone())
+            .ok_or_else(|| anyhow::anyhow!("Could not find encrypted file"))?;
+
+        // Split into directory and filename
+        let parts: Vec<&str> = encrypted_path.split('/').collect();
+        assert_eq!(parts.len(), 2, "Encrypted path should have directory and filename");
+
+        let encrypted_dirname = parts[0];
+        let encrypted_filename = parts[1];
+
+        // Verify directory name follows nanoid pattern
+        assert_eq!(encrypted_dirname.len(), FILENAME_LENGTH, "Directory name should be {} characters", FILENAME_LENGTH);
+        assert!(encrypted_dirname.chars().all(|c| NANOID_ALPHABET.contains(c)), 
+            "Directory name should only contain characters from custom alphabet");
+
+        // Verify filename follows nanoid pattern (excluding .sealed extension)
+        let filename_without_ext = encrypted_filename.strip_suffix(&format!(".{}", EXTENSION))
+            .ok_or_else(|| anyhow::anyhow!("Filename should have .sealed extension"))?;
+        assert_eq!(filename_without_ext.len(), FILENAME_LENGTH, "Filename should be {} characters", FILENAME_LENGTH);
+        assert!(filename_without_ext.chars().all(|c| NANOID_ALPHABET.contains(c)),
+            "Filename should only contain characters from custom alphabet");
 
         Ok(())
     }

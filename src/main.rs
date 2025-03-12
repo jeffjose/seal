@@ -17,6 +17,8 @@ use std::{collections::HashMap, fs, path::Path};
 use walkdir::WalkDir;
 use tempfile::TempDir;
 use uuid;
+use twox_hash::xxh3::Hash64;
+use std::hash::Hasher;
 
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
@@ -77,6 +79,9 @@ enum Commands {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
     },
+    /// Calculate hash of files and directories in current directory
+    #[command(alias = "h")]
+    Hash,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,6 +127,9 @@ fn main() -> Result<()> {
             } else {
                 run_command_on_files_at_path(command, None, current_dir)?;
             }
+        }
+        Some(Commands::Hash) => {
+            hash_directory_at_path(current_dir)?;
         }
         None => {
             if let Some(password) = &cli.password {
@@ -980,6 +988,9 @@ fn run_test_mode(cli: &Cli) -> Result<()> {
         }
         Some(Commands::Run { command }) => {
             run_command_on_files_at_path(command, Some(password), test_dir)?;
+        }
+        Some(Commands::Hash) => {
+            hash_directory_at_path(test_dir)?;
         }
         None => {
             encrypt_directory_with_password_and_files_at_path(password, &cli.files, test_dir)?;
@@ -2225,6 +2236,9 @@ mod tests {
             Some(Commands::Run { command }) => {
                 run_command_on_files_at_path(command, Some(&cli.password.unwrap()), base_dir)?
             }
+            Some(Commands::Hash) => {
+                hash_directory_at_path(base_dir)?;
+            }
             None => {
                 if let Some(password) = &cli.password {
                     encrypt_directory_with_password_and_files_at_path(password, &cli.files, base_dir)?
@@ -2445,6 +2459,96 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_hash_directory() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_path = temp_dir.path();
+
+        // Create some test files with known content
+        fs::write(base_path.join("file1.txt"), b"Hello, World!")?;
+        fs::write(base_path.join("file2.txt"), b"Another test file")?;
+        fs::create_dir(base_path.join("subdir"))?;
+        fs::write(base_path.join("subdir").join("file3.txt"), b"File in subdir")?;
+
+        // Create a hidden file and directory
+        fs::write(base_path.join(".hidden_file"), b"Hidden file content")?;
+        fs::create_dir(base_path.join(".hidden_dir"))?;
+        fs::write(
+            base_path.join(".hidden_dir").join("hidden_file.txt"),
+            b"Hidden file in hidden dir",
+        )?;
+
+        // Calculate initial hash
+        let mut hasher1 = Hash64::default();
+        for entry in WalkDir::new(base_path)
+            .sort_by_key(|e| e.path().to_path_buf())
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            let relative_path = path.strip_prefix(base_path)?.to_string_lossy().to_string();
+            if relative_path.contains(SEAL_DIR) {
+                continue;
+            }
+            hasher1.write(relative_path.as_bytes());
+            if path.is_file() {
+                let contents = fs::read(path)?;
+                hasher1.write(&contents);
+            }
+        }
+        let hash1 = hasher1.finish();
+
+        // Modify a file and verify the hash changes
+        fs::write(base_path.join("file1.txt"), b"Modified content")?;
+        let mut hasher2 = Hash64::default();
+        for entry in WalkDir::new(base_path)
+            .sort_by_key(|e| e.path().to_path_buf())
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            let relative_path = path.strip_prefix(base_path)?.to_string_lossy().to_string();
+            if relative_path.contains(SEAL_DIR) {
+                continue;
+            }
+            hasher2.write(relative_path.as_bytes());
+            if path.is_file() {
+                let contents = fs::read(path)?;
+                hasher2.write(&contents);
+            }
+        }
+        let hash2 = hasher2.finish();
+
+        // The hash should change when file content changes
+        assert_ne!(hash1, hash2, "Hash should change when file content changes");
+
+        // Modify a hidden file and verify the hash changes
+        fs::write(base_path.join(".hidden_file"), b"Modified hidden content")?;
+        let mut hasher3 = Hash64::default();
+        for entry in WalkDir::new(base_path)
+            .sort_by_key(|e| e.path().to_path_buf())
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            let relative_path = path.strip_prefix(base_path)?.to_string_lossy().to_string();
+            if relative_path.contains(SEAL_DIR) {
+                continue;
+            }
+            hasher3.write(relative_path.as_bytes());
+            if path.is_file() {
+                let contents = fs::read(path)?;
+                hasher3.write(&contents);
+            }
+        }
+        let hash3 = hasher3.finish();
+
+        // The hash should change when hidden file content changes
+        assert_ne!(hash2, hash3, "Hash should change when hidden file content changes");
+
+        Ok(())
+    }
 }
 
 fn decrypt_directory_with_password(password: &str, base_dir: &Path) -> Result<()> {
@@ -2535,4 +2639,65 @@ fn decrypt_directory_with_password(password: &str, base_dir: &Path) -> Result<()
     } else {
         return Err(anyhow::anyhow!("No metadata file found"));
     }
+}
+
+/// Calculate a deterministic hash of directory contents
+fn hash_directory_at_path(base_dir: &Path) -> Result<()> {
+    let mut entries = Vec::new();
+    let mut total_size = 0u64;
+
+    // First pass: collect all entries and calculate total size
+    for entry in WalkDir::new(base_dir)
+        .sort_by_key(|e| e.path().to_path_buf()) // Sort for deterministic order
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        let relative_path = path.strip_prefix(base_dir)?.to_string_lossy().to_string();
+
+        // Skip .seal directory
+        if relative_path.contains(SEAL_DIR) {
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                total_size += metadata.len();
+            }
+        }
+        entries.push(path.to_path_buf());
+    }
+
+    // Setup progress bar
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    // Calculate combined hash
+    let mut combined_hasher = Hash64::default();
+
+    // Process all entries in sorted order for deterministic results
+    for path in entries {
+        let relative_path = path.strip_prefix(base_dir)?.to_string_lossy().to_string();
+        
+        // Hash the path itself
+        combined_hasher.write(relative_path.as_bytes());
+        
+        if path.is_file() {
+            // Hash file contents
+            let contents = fs::read(&path)?;
+            combined_hasher.write(&contents);
+            pb.inc(contents.len() as u64);
+        }
+    }
+
+    let final_hash = combined_hasher.finish();
+    pb.finish_and_clear();
+
+    println!("Directory hash: {:016x}", final_hash);
+    Ok(())
 }

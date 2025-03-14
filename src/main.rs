@@ -15,7 +15,6 @@ use shell_escape::escape;
 use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
 use walkdir::WalkDir;
-use tempfile::TempDir;
 use uuid;
 use twox_hash::xxh3::Hash64;
 use std::hash::Hasher;
@@ -31,6 +30,7 @@ const NANOID_ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz"; // Only lo
 const TEMP_EXTENSION: &str = "seal.tmp"; // Extension for temporary files during encryption
 
 // Constants for streaming
+#[allow(dead_code)]
 const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
 #[cfg(not(test))]
 const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB for normal operation
@@ -166,6 +166,7 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
     Ok(key)
 }
 
+#[allow(dead_code)]
 fn encrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     // Check if this is a large file that needs streaming
     let metadata = fs::metadata(path)?;
@@ -198,6 +199,7 @@ fn encrypt_file(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+#[allow(dead_code)]
 fn encrypt_file_streaming(path: &Path, cipher: &Aes256Gcm) -> Result<Vec<u8>> {
     use std::io::{Read, Write};
 
@@ -374,7 +376,7 @@ fn generate_friendly_dirname() -> String {
     )
 }
 
-/// Create encrypted directory structure based on original path
+#[allow(dead_code)]
 fn create_encrypted_path(original_path: &str, base_dir: &Path) -> Result<String> {
     // Extract directory components from the original path
     let path = Path::new(original_path);
@@ -597,6 +599,7 @@ fn run_command_on_files_at_path(command: &[String], password: Option<&str>, base
     Ok(())
 }
 
+#[allow(dead_code)]
 fn encrypt_directory() -> Result<()> {
     encrypt_directory_with_password(&get_password("Enter password: ")?, Path::new("."))
 }
@@ -679,7 +682,7 @@ fn encrypt_directory_with_password(password: &str, base_dir: &Path) -> Result<()
 
     // Derive key with the salt
     let key = derive_key(password.as_bytes(), &salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let _cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
     // Create a list of files to encrypt
     let files_to_encrypt: Vec<String> = WalkDir::new(base_dir)
@@ -882,11 +885,11 @@ fn encrypt_directory_with_password(password: &str, base_dir: &Path) -> Result<()
 fn encrypt_file_at_path(
     file_path: &Path,
     base_dir: &Path,
-    salt: &[u8],
+    _salt: &[u8],
     key: &[u8],
 ) -> Result<String> {
     let file_content = fs::read(file_path)?;
-    let file_name = file_path
+    let _file_name = file_path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?
         .to_string_lossy()
@@ -1081,7 +1084,7 @@ fn encrypt_directory_with_password_and_files_at_path(password: &str, files: &[St
 
     // Derive key with the salt
     let key = derive_key(password.as_bytes(), &salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let _cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
     // Filter and validate input files
     let files_to_encrypt: Vec<String> = if files.is_empty() {
@@ -1379,9 +1382,9 @@ fn decrypt_directory_with_password_and_files_at_path(password: &str, files: &[St
         }
 
         let key = derive_key(password.as_bytes(), &salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let _cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
-        let result = decrypt_files_with_cipher(&files_to_decrypt, &cipher, base_dir);
+        let result = decrypt_files_with_cipher(&files_to_decrypt, &_cipher, base_dir);
 
         // Clean up empty directories after decryption
         if result.is_ok() {
@@ -1425,7 +1428,7 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
             base_dir.join(SEAL_DIR).join(Path::new(encrypted_name).file_name().unwrap_or_default()),
         ];
         
-        let mut found_path = None;
+        let mut found = false;
         
         for path in &possible_paths {
             #[cfg(test)]
@@ -1438,7 +1441,7 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
                         total_size += size;
                         file_sizes.insert(encrypted_name.clone(), size);
                         files_exist.push((encrypted_name.clone(), original_name.clone()));
-                        found_path = Some(path.clone());
+                        found = true;
                         break;
                     }
                     Err(e) => {
@@ -1455,52 +1458,49 @@ fn decrypt_files_with_cipher(files: &HashMap<String, String>, cipher: &Aes256Gcm
             }
         }
         
-        if found_path.is_none() {
-            // If we still haven't found the file, try one more approach:
-            // Parse the encrypted_name to see if it's in the format "dirname/filename.sealed"
-            if found_path.is_none() && encrypted_name.contains('/') {
-                let parts: Vec<&str> = encrypted_name.split('/').collect();
-                if parts.len() == 2 {
-                    let dirname = parts[0];
-                    let filename = parts[1];
-                    
-                    // Check if the directory exists in the base directory
-                    let dir_path = base_dir.join(dirname);
+        // If we still haven't found the file, try one more approach:
+        // Parse the encrypted_name to see if it's in the format "dirname/filename.sealed"
+        if !found && encrypted_name.contains('/') {
+            let parts: Vec<&str> = encrypted_name.split('/').collect();
+            if parts.len() == 2 {
+                let dirname = parts[0];
+                let filename = parts[1];
+                
+                // Check if the directory exists in the base directory
+                let dir_path = base_dir.join(dirname);
+                
+                #[cfg(test)]
+                println!("Checking split path directory: {}", dir_path.display());
+                
+                if dir_path.exists() && dir_path.is_dir() {
+                    let file_path = dir_path.join(filename);
                     
                     #[cfg(test)]
-                    println!("Checking split path directory: {}", dir_path.display());
+                    println!("Checking split path for encrypted file at: {}", file_path.display());
                     
-                    if dir_path.exists() && dir_path.is_dir() {
-                        let file_path = dir_path.join(filename);
-                        
-                        #[cfg(test)]
-                        println!("Checking split path for encrypted file at: {}", file_path.display());
-                        
-                        if file_path.exists() {
-                            match fs::metadata(&file_path) {
-                                Ok(metadata) => {
-                                    let size = metadata.len();
-                                    total_size += size;
-                                    file_sizes.insert(encrypted_name.clone(), size);
-                                    files_exist.push((encrypted_name.clone(), original_name.clone()));
-                                    found_path = Some(file_path);
-                                }
-                                Err(e) => {
-                                    #[cfg(test)]
-                                    println!(
-                                        "Error getting metadata for file {}: {:?}",
-                                        file_path.display(), e
-                                    );
-                                }
+                    if file_path.exists() {
+                        match fs::metadata(&file_path) {
+                            Ok(metadata) => {
+                                let size = metadata.len();
+                                total_size += size;
+                                file_sizes.insert(encrypted_name.clone(), size);
+                                files_exist.push((encrypted_name.clone(), original_name.clone()));
                             }
-                        } else {
-                            #[cfg(test)]
-                            println!("Encrypted file not found at split path: {}", file_path.display());
+                            Err(e) => {
+                                #[cfg(test)]
+                                println!(
+                                    "Error getting metadata for file {}: {:?}",
+                                    file_path.display(), e
+                                );
+                            }
                         }
                     } else {
                         #[cfg(test)]
-                        println!("Directory not found: {}", dir_path.display());
+                        println!("Encrypted file not found at split path: {}", file_path.display());
                     }
+                } else {
+                    #[cfg(test)]
+                    println!("Directory not found: {}", dir_path.display());
                 }
             }
         }
@@ -2622,10 +2622,10 @@ fn decrypt_directory_with_password(password: &str, base_dir: &Path) -> Result<()
 
         // Verify password by trying to derive a key and create a cipher
         let key = derive_key(password.as_bytes(), &salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let _cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
         // Decrypt all files
-        let result = decrypt_files_with_cipher(&files, &cipher, base_dir);
+        let result = decrypt_files_with_cipher(&files, &_cipher, base_dir);
 
         // If decryption was successful, remove the metadata file and salt file
         if result.is_ok() {

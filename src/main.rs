@@ -15,7 +15,6 @@ use shell_escape::escape;
 use std::io::Write;
 use std::{collections::HashMap, fs, path::Path};
 use walkdir::WalkDir;
-use uuid;
 use twox_hash::xxh3::Hash64;
 use std::hash::Hasher;
 
@@ -2551,6 +2550,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn decrypt_directory_with_password(password: &str, base_dir: &Path) -> Result<()> {
     // Create .seal directory if it doesn't exist
     let seal_dir = base_dir.join(SEAL_DIR);
@@ -2698,6 +2698,6 @@ fn hash_directory_at_path(base_dir: &Path) -> Result<()> {
     let final_hash = combined_hasher.finish();
     pb.finish_and_clear();
 
-    println!("Directory hash: {:016x}", final_hash);
+    println!("{:016x}", final_hash);
     Ok(())
 }
